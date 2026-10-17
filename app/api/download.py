@@ -173,10 +173,7 @@ async def download_video(  # noqa: C901
     if request.async_mode:
         # Async mode: enqueue and return immediately
         try:
-            position = await download_queue.enqueue(
-                job.job_id,
-                priority=PRIORITY_DOWNLOAD,
-            )
+            position = await download_queue.enqueue(job.job_id, priority=PRIORITY_DOWNLOAD)
             job_service.set_queue_position(job.job_id, position)
         except ValueError as e:
             # Queue is full
@@ -217,10 +214,7 @@ async def download_video(  # noqa: C901
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={
                     "error_code": "NO_SLOTS_AVAILABLE",
-                    "message": (
-                        "All download slots are in use. "
-                        "Try again later or use async mode."
-                    ),
+                    "message": "All download slots are in use. Try again later or use async mode.",
                 },
             )
 
@@ -288,9 +282,7 @@ async def download_video(  # noqa: C901
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail={
                         "error_code": "INTERNAL_ERROR",
-                        "message": (
-                            f"Unexpected job status: {updated_job.status.value}"
-                        ),
+                        "message": f"Unexpected job status: {updated_job.status.value}",
                     },
                 )
 
