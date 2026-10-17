@@ -73,6 +73,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
              /etc/apt/sources.list.d/nodesource.list
 
 
+# Install Deno, the recommended JavaScript runtime for yt-dlp EJS
+RUN curl -fsSL https://deno.land/install.sh \
+    | DENO_INSTALL=/usr/local sh -s -- -y \
+    && deno --version
+
+
 # =============================================================================
 # Create non-root user
 # =============================================================================
