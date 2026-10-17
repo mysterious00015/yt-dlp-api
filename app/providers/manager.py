@@ -24,21 +24,29 @@ class ProviderManager:
         provider: VideoProvider,
         enabled: bool = True,
     ) -> None:
-        """Register a provider and configure whether it is enabled."""
-        if not name or not isinstance(name, str):
-            raise ValueError("Provider name must be a non-empty string")
+        """
+        Register a video provider.
 
+        Args:
+            name: Provider name (e.g., "youtube")
+            provider: Provider instance
+            enabled: Whether provider is enabled
+        """
         self._providers[name] = provider
         self._enabled_providers[name] = enabled
 
-        logger.info(
-            "Provider registered",
-            provider=name,
-            enabled=enabled,
-        )
+        logger.info("Provider registered", provider=name, enabled=enabled)
 
     def enable_provider(self, name: str) -> None:
-        """Enable a registered provider."""
+        """
+        Enable a registered provider.
+
+        Args:
+            name: Provider name
+
+        Raises:
+            ValueError: If provider is not registered
+        """
         if name not in self._providers:
             raise ValueError(f"Provider '{name}' is not registered")
 
@@ -46,7 +54,15 @@ class ProviderManager:
         logger.info("Provider enabled", provider=name)
 
     def disable_provider(self, name: str) -> None:
-        """Disable a registered provider."""
+        """
+        Disable a registered provider.
+
+        Args:
+            name: Provider name
+
+        Raises:
+            ValueError: If provider is not registered
+        """
         if name not in self._providers:
             raise ValueError(f"Provider '{name}' is not registered")
 
@@ -54,100 +70,85 @@ class ProviderManager:
         logger.info("Provider disabled", provider=name)
 
     def is_provider_enabled(self, name: str) -> bool:
-        """Return whether a provider is enabled."""
+        """
+        Check if a provider is enabled.
+
+        Args:
+            name: Provider name
+
+        Returns:
+            True if provider is enabled, False otherwise
+        """
         return self._enabled_providers.get(name, False)
 
-    @staticmethod
-    def _provider_priority(name: str) -> tuple[int, str]:
-        """Return provider selection priority.
-
-        YouTube must use its dedicated provider. Other specifically
-        registered providers get a chance before the generic provider.
-        The generic provider is the fallback for recognized yt-dlp sites.
-        """
-        normalized = name.lower()
-
-        if normalized == "youtube":
-            return (0, normalized)
-
-        if normalized in {
-            "generic_ytdlp",
-            "generic",
-            "ytdlp_generic",
-        }:
-            return (100, normalized)
-
-        return (10, normalized)
-
     def get_provider_for_url(self, url: str) -> VideoProvider:
-        """Select the highest-priority enabled provider that accepts a URL.
+        """
+        Select appropriate provider based on URL.
+
+        Args:
+            url: Video URL
+
+        Returns:
+            Provider instance that can handle the URL
 
         Raises:
-            InvalidURLError: If no enabled provider accepts the URL.
+            InvalidURLError: If no provider can handle the URL
         """
-        if not isinstance(url, str) or not url.strip():
-            raise InvalidURLError("A valid media URL is required.")
-
-        ordered_names = sorted(
-            self._providers.keys(),
-            key=self._provider_priority,
-        )
-
-        for name in ordered_names:
-            provider = self._providers[name]
-
+        for name, provider in self._providers.items():
+            # Skip disabled providers
             if not self._enabled_providers.get(name, False):
                 continue
 
             try:
                 if provider.validate_url(url):
-                    logger.info(
+                    logger.debug(
                         "Provider selected for URL",
                         provider=name,
-                        # Avoid logging the full URL, which may contain
-                        # private query parameters or access tokens.
-                        hostname=self._safe_hostname(url),
+                        url=url,
                     )
                     return provider
-
-            except Exception as exc:
-                # A faulty provider must not prevent other providers
-                # from checking the URL.
+            except Exception as e:
+                # Isolate provider errors - don't let one provider's
+                # validation error prevent checking other providers
                 logger.warning(
                     "Provider validation error",
                     provider=name,
-                    hostname=self._safe_hostname(url),
-                    error=str(exc)[:300],
+                    url=url,
+                    error=str(e),
                 )
+                continue
 
+        # No provider found
         raise InvalidURLError(
-            "No enabled provider can handle this URL. "
-            "The website may not be supported by the installed "
-            "yt-dlp extractors, or the relevant provider may be disabled."
+            f"No provider available for URL: {url}. "
+            "Ensure the URL is from a supported platform and the provider is enabled."
         )
-
-    @staticmethod
-    def _safe_hostname(url: str) -> str:
-        """Extract a hostname for logs without recording URL parameters."""
-        from urllib.parse import urlparse
-
-        try:
-            return (urlparse(url).hostname or "unknown")[:200]
-        except ValueError:
-            return "unknown"
 
     def get_provider_by_name(
         self,
         name: str,
     ) -> Optional[VideoProvider]:
-        """Return a registered provider by name, or None if absent."""
+        """
+        Get a provider by name.
+
+        Args:
+            name: Provider name
+
+        Returns:
+            Provider instance, or None if not found
+        """
         return self._providers.get(name)
 
     def list_providers(self) -> Dict[str, bool]:
-        """Return registered provider names and their enabled states."""
+        """
+        List all registered providers and their status.
+
+        Returns:
+            Dictionary mapping provider names to enabled status
+        """
         return {
             name: self._enabled_providers.get(name, False)
-            for name in self._providers
+            for name in self._providers.keys()
         }
 
     async def execute_with_error_isolation(
@@ -157,12 +158,28 @@ class ProviderManager:
         *args: Any,
         **kwargs: Any,
     ) -> Any:
-        """Execute a provider operation with consistent error handling."""
+        """
+        Execute a provider operation with error isolation.
+
+        This ensures that errors from one provider don't crash the entire system.
+
+        Args:
+            provider_name: Name of the provider
+            operation: Async callable to execute
+            *args: Positional arguments for operation
+            **kwargs: Keyword arguments for operation
+
+        Returns:
+            Result of the operation
+
+        Raises:
+            ProviderError: If operation fails
+        """
         try:
             logger.debug(
                 "Executing provider operation",
                 provider=provider_name,
-                operation=getattr(operation, "__name__", "unknown"),
+                operation=operation.__name__,
             )
 
             result = await operation(*args, **kwargs)
@@ -170,30 +187,25 @@ class ProviderManager:
             logger.debug(
                 "Provider operation completed",
                 provider=provider_name,
-                operation=getattr(operation, "__name__", "unknown"),
+                operation=operation.__name__,
             )
 
             return result
 
         except ProviderError:
+            # Re-raise provider errors as-is
             raise
 
-        except Exception as exc:
-            operation_name = getattr(
-                operation,
-                "__name__",
-                "unknown",
-            )
-
+        except Exception as e:
+            # Wrap unexpected errors
             logger.error(
-                "Provider operation failed",
+                "Provider operation failed with unexpected error",
                 provider=provider_name,
-                operation=operation_name,
-                error=str(exc),
+                operation=operation.__name__,
+                error=str(e),
                 exc_info=True,
             )
 
             raise ProviderError(
-                f"Provider '{provider_name}' encountered an unexpected error: "
-                f"{str(exc)}"
-            ) from exc
+                f"Provider '{provider_name}' encountered an unexpected error: {str(e)}"
+            ) from e
