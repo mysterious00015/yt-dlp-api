@@ -1,16 +1,14 @@
-# yt-dlp pin, kept in its own file so the Docker build and the weekly
-# image refresh can manage it independently from the app dependencies.
-# Dependabot bumps this weekly; the docker-publish workflow's scheduled
-# run additionally builds a rolling `weekly` tag with the latest release.
-# Extras: `default` = the standard runtime set of the official binary;
-# `curl-cffi` = browser TLS-fingerprint impersonation (yt-dlp picks a
-# compatible curl_cffi version), which avoids anti-bot blocks especially
-# from datacenter IPs.
+
+# yt-dlp pin, managed independently from application dependencies.
+# Extras provide the standard runtime and curl-cffi support.
 yt-dlp[default,curl-cffi]==2026.08.19
-# Explicit pin for reproducible builds; the curl-cffi extra above keeps
-# pip checking it against yt-dlp's tested compatibility range (a conflict
-# fails the build loudly instead of drifting silently)
+
+# Pin curl-cffi for reproducible browser TLS-fingerprint support.
 curl_cffi==0.15.0
-# EJS challenge-solver scripts: required since YouTube signature/n-challenge
-# enforcement; the pip install of yt-dlp does not bundle them (BUG-004)
+
+# EJS challenge-solver scripts for YouTube JavaScript challenges.
 yt-dlp-ejs==0.8.0
+
+# YouTube Proof-of-Origin token provider plugin.
+# A compatible BgUtils provider backend must also be configured.
+bgutil-ytdlp-pot-provider==1.3.1
