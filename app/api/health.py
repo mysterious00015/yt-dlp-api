@@ -247,11 +247,44 @@ async def _check_youtube_connectivity() -> ComponentHealth:
             stderr=asyncio.subprocess.PIPE,
         )
 
+        communicate_task = asyncio.create_task(proc.communicate())
+
+try:
+    stdout, stderr = await asyncio.wait_for(
+        asyncio.shield(communicate_task),
+        timeout=float(timeout),
+    )
+except asyncio.TimeoutError:
+    if proc.returncode is None:
+        proc.kill()
+
+    try:
         stdout, stderr = await asyncio.wait_for(
-            proc.communicate(),
-            timeout=float(timeout),
+            communicate_task,
+            timeout=3.0,
+        )
+    except Exception as capture_error:
+        stdout, stderr = b"", b""
+        logger.warning(
+            "youtube_timeout_output_capture_failed",
+            error=str(capture_error),
         )
 
+    logger.warning(
+        "youtube_connectivity_check_timeout",
+        timeout_seconds=timeout,
+        stdout=stdout.decode(errors="replace")[-500:],
+        stderr=stderr.decode(errors="replace")[-1500:],
+    )
+
+    return ComponentHealth(
+        status="unhealthy",
+        details={
+            "error": (
+                f"YouTube connectivity test timed out (>{timeout}s)"
+            )
+        },
+    )
         latency_ms = int(
             (time.time() - start_time) * 1000
         )
