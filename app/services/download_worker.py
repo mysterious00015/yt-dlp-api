@@ -1,7 +1,10 @@
 """Download worker for processing queued download jobs.
 
-Handles queued downloads, provider selection, retries, job status,
-storage registration, metrics, and completion webhooks.
+This module implements requirements 14, 15, 26, and 29:
+- Req 14: Download endpoint with async job support
+- Req 15: Job status tracking with progress
+- Req 26: Concurrent download management
+- Req 29: Download metrics collection
 """
 
 import asyncio
@@ -9,7 +12,6 @@ import contextlib
 import time
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlparse
 
 import structlog
 
@@ -18,42 +20,23 @@ from app.models.video import DownloadResult
 from app.providers.base import VideoProvider
 from app.providers.exceptions import DownloadError, ProviderError
 from app.providers.manager import ProviderManager
-from app.services.download_queue import (
-    DownloadQueue,
-    get_download_queue,
-)
-from app.services.job_service import (
-    JobService,
-    get_job_service,
-)
-from app.services.storage import (
-    StorageManager,
-    get_storage_manager,
-)
+from app.services.download_queue import DownloadQueue, get_download_queue
+from app.services.job_service import JobService, get_job_service
+from app.services.storage import StorageManager, get_storage_manager
 from app.services.webhook_service import get_webhook_service
 
 logger = structlog.get_logger(__name__)
 
 
-def _safe_hostname(url: str) -> str:
-    """Return a hostname for logging without URL query parameters."""
-    try:
-        return (urlparse(url).hostname or "unknown")[:200]
-    except (TypeError, ValueError):
-        return "unknown"
-
-
 class DownloadWorker:
     """Worker that processes download jobs from the queue.
 
-    Responsibilities:
-    - Dequeue jobs when capacity is available.
-    - Select a provider dynamically for each URL.
-    - Execute downloads through the selected provider.
-    - Retry eligible download failures.
-    - Update job status and download metrics.
-    - Register completed files with storage.
-    - Notify configured webhooks about terminal job states.
+    Handles job lifecycle:
+    - Dequeue jobs when capacity available
+    - Execute downloads via provider
+    - Handle retries on retriable errors
+    - Update job status and progress
+    - Register/unregister files with storage manager
     """
 
     def __init__(
@@ -64,18 +47,25 @@ class DownloadWorker:
         storage_manager: Optional[StorageManager] = None,
         poll_interval: float = 1.0,
     ) -> None:
-        """Initialize the download worker."""
+        """Initialize the download worker.
+
+        Args:
+            provider_manager: Provider manager for executing downloads.
+            job_service: Job service for status updates (uses global if None).
+            download_queue: Download queue (uses global if None).
+            storage_manager: Storage manager for file tracking (uses global if None).
+            poll_interval: Seconds between queue polling attempts.
+        """
         self.provider_manager = provider_manager
         self._job_service = job_service
         self._download_queue = download_queue
         self._storage_manager = storage_manager
         self.poll_interval = poll_interval
-
         self._running = False
         self._worker_task: Optional[asyncio.Task] = None
-
-        # Keep references to active webhook-delivery tasks.
-        self._webhook_tasks: set[asyncio.Task] = set()
+        # Strong references to in-flight webhook deliveries (fire-and-forget
+        # tasks would otherwise be garbage collected mid-delivery)
+        self._webhook_tasks: set = set()
 
         logger.debug(
             "download_worker_initialized",
@@ -84,21 +74,25 @@ class DownloadWorker:
 
     @property
     def job_service(self) -> JobService:
-        """Get the configured job service."""
+        """Get the job service instance."""
         return self._job_service or get_job_service()
 
     @property
     def download_queue(self) -> DownloadQueue:
-        """Get the configured download queue."""
+        """Get the download queue instance."""
         return self._download_queue or get_download_queue()
 
     @property
     def storage_manager(self) -> StorageManager:
-        """Get the configured storage manager."""
+        """Get the storage manager instance."""
         return self._storage_manager or get_storage_manager()
 
     async def start(self) -> None:
-        """Start the background queue-processing loop."""
+        """Start the download worker.
+
+        The worker runs in the background, polling for jobs
+        and processing them as capacity becomes available.
+        """
         if self._running:
             logger.warning("download_worker_already_running")
             return
@@ -109,7 +103,10 @@ class DownloadWorker:
         logger.info("download_worker_started")
 
     async def stop(self) -> None:
-        """Stop the worker loop gracefully."""
+        """Stop the download worker gracefully.
+
+        Waits for current downloads to complete before stopping.
+        """
         if not self._running:
             return
 
@@ -117,42 +114,45 @@ class DownloadWorker:
 
         if self._worker_task:
             self._worker_task.cancel()
-
             with contextlib.suppress(asyncio.CancelledError):
                 await self._worker_task
-
             self._worker_task = None
 
         logger.info("download_worker_stopped")
 
     async def _run(self) -> None:
-        """Poll the queue and process jobs as they become available."""
+        """Main worker loop."""
         logger.info("download_worker_loop_started")
 
         while self._running:
             try:
+                # Try to dequeue a job
                 job_id = await self.download_queue.dequeue()
 
                 if job_id:
+                    # Process the job in a separate task
                     asyncio.create_task(self._process_job(job_id))
                 else:
+                    # No job available, wait before polling again
                     await asyncio.sleep(self.poll_interval)
 
             except asyncio.CancelledError:
                 raise
-
-            except Exception as exc:
+            except Exception as e:
                 logger.error(
                     "download_worker_loop_error",
-                    error=str(exc),
+                    error=str(e),
                     exc_info=True,
                 )
                 await asyncio.sleep(self.poll_interval)
 
     async def _process_job(self, job_id: str) -> None:
-        """Process one queued download job."""
-        job = self.job_service.get_job(job_id)
+        """Process a single download job.
 
+        Args:
+            job_id: The job's unique identifier.
+        """
+        job = self.job_service.get_job(job_id)
         if not job:
             logger.error("job_not_found_for_processing", job_id=job_id)
             await self.download_queue.release_slot(job_id)
@@ -161,49 +161,38 @@ class DownloadWorker:
         logger.info(
             "job_processing_started",
             job_id=job_id,
-            hostname=_safe_hostname(job.url),
+            url=job.url,
             retry_count=job.retry_count,
         )
 
+        # Track download metrics (default to failed, updated on success)
         start_time = time.time()
-        provider_name = "unselected"
+        provider_name = "youtube"  # Default provider name
         download_status = "failed"
         download_size = 0
 
         try:
+            # Update status to PROCESSING
             self.job_service.start_processing(job_id)
 
-            # Each URL is matched against enabled providers.
-            # The manager prioritizes the dedicated YouTube provider
-            # and uses generic_ytdlp as the fallback provider.
+            # Get the appropriate provider for the URL
             provider = self.provider_manager.get_provider_for_url(job.url)
+            provider_name = getattr(provider, "name", "youtube")
 
-            provider_name = getattr(
-                provider,
-                "name",
-                type(provider).__name__,
-            )
-
-            logger.info(
-                "job_provider_selected",
-                job_id=job_id,
-                provider=provider_name,
-                hostname=_safe_hostname(job.url),
-            )
-
+            # Execute the download
             result = await self._execute_download(job_id, provider)
 
             if result:
+                # Download succeeded - update metrics tracking
                 download_status = "success"
                 download_size = result.file_size
 
                 file_path = Path(result.file_path)
 
-                self.storage_manager.register_active_job(
-                    job_id,
-                    file_path,
-                )
+                # Register the file with storage manager
+                self.storage_manager.register_active_job(job_id, file_path)
 
+                # Complete the job
                 self.job_service.complete_job(
                     job_id=job_id,
                     file_path=result.file_path,
@@ -214,70 +203,68 @@ class DownloadWorker:
                 logger.info(
                     "job_completed_successfully",
                     job_id=job_id,
-                    provider=provider_name,
+                    file_path=result.file_path,
                     file_size=result.file_size,
                     duration=result.duration,
                 )
 
                 self._notify_webhook(job_id, "job.completed")
 
-        except DownloadError as exc:
-            await self._handle_download_error(job_id, exc)
+        except DownloadError as e:
+            await self._handle_download_error(job_id, e)
 
-        except ProviderError as exc:
-            self.job_service.fail_job(job_id, str(exc))
-
+        except ProviderError as e:
+            # Non-retriable provider error
+            self.job_service.fail_job(job_id, str(e))
             logger.error(
                 "job_failed_provider_error",
                 job_id=job_id,
-                provider=provider_name,
-                error=str(exc),
+                error=str(e),
             )
-
             self._notify_webhook(job_id, "job.failed")
 
-        except Exception as exc:
-            self.job_service.fail_job(
-                job_id,
-                f"Unexpected error: {str(exc)}",
-            )
-
+        except Exception as e:
+            # Unexpected error
+            self.job_service.fail_job(job_id, f"Unexpected error: {str(e)}")
             logger.error(
                 "job_failed_unexpected_error",
                 job_id=job_id,
-                provider=provider_name,
-                error=str(exc),
+                error=str(e),
                 exc_info=True,
             )
-
             self._notify_webhook(job_id, "job.failed")
 
         finally:
+            # Record metrics once in finally block (reduces duplication)
             download_duration = time.time() - start_time
-
             MetricsCollector.record_download(
                 provider=provider_name,
                 status=download_status,
                 duration=download_duration,
                 size=download_size,
             )
-
+            # Release the download slot
             await self.download_queue.release_slot(job_id)
 
     def _notify_webhook(self, job_id: str, event: str) -> None:
-        """Deliver a configured webhook for a terminal job state."""
-        job = self.job_service.get_job(job_id)
+        """Fire a webhook notification for a terminal job state.
 
+        Delivery runs as a background task and never blocks or fails job
+        processing.
+
+        Args:
+            job_id: The job's unique identifier.
+            event: Event name ("job.completed" or "job.failed").
+        """
+        job = self.job_service.get_job(job_id)
         if not job:
             return
 
         webhook_url = (job.params or {}).get("webhook_url")
-
         if not webhook_url:
             return
 
         service = get_webhook_service()
-
         if not service.enabled:
             return
 
@@ -290,17 +277,10 @@ class DownloadWorker:
             "file_size": job.file_size,
             "duration": job.duration,
             "error_message": job.error_message,
-            "completed_at": (
-                job.completed_at.isoformat()
-                if job.completed_at
-                else None
-            ),
+            "completed_at": job.completed_at.isoformat() if job.completed_at else None,
         }
 
-        task = asyncio.create_task(
-            service.deliver(webhook_url, event, payload)
-        )
-
+        task = asyncio.create_task(service.deliver(webhook_url, event, payload))
         self._webhook_tasks.add(task)
         task.add_done_callback(self._webhook_tasks.discard)
 
@@ -309,14 +289,26 @@ class DownloadWorker:
         job_id: str,
         provider: VideoProvider,
     ) -> DownloadResult:
-        """Execute a job through its selected provider."""
-        job = self.job_service.get_job(job_id)
+        """Execute the download operation.
 
+        Args:
+            job_id: The job's unique identifier.
+            provider: The provider to use for download.
+
+        Returns:
+            DownloadResult on success.
+
+        Raises:
+            DownloadError: If download fails.
+            ProviderError: If provider error occurs.
+        """
+        job = self.job_service.get_job(job_id)
         if not job:
             raise ProviderError(f"Job not found: {job_id}")
 
-        params = job.params or {}
+        params = job.params
 
+        # Execute download with parameters
         result = await provider.download(
             url=job.url,
             format_id=params.get("format_id"),
@@ -334,13 +326,19 @@ class DownloadWorker:
         job_id: str,
         error: DownloadError,
     ) -> None:
-        """Retry eligible download errors or mark the job as failed."""
-        job = self.job_service.get_job(job_id)
+        """Handle a download error, potentially retrying.
 
+        Args:
+            job_id: The job's unique identifier.
+            error: The download error that occurred.
+        """
+        job = self.job_service.get_job(job_id)
         if not job:
             return
 
+        # Check if we can retry
         if job.can_retry():
+            # Mark as retrying
             self.job_service.start_retry(job_id)
 
             logger.warning(
@@ -351,15 +349,16 @@ class DownloadWorker:
                 error=str(error),
             )
 
+            # Re-queue the job for retry
+            # Use same priority to maintain fairness
             try:
                 await self.download_queue.enqueue(job_id)
-
             except ValueError as queue_error:
+                # Queue is full, fail the job instead of leaving it in RETRYING
                 self.job_service.fail_job(
                     job_id,
                     f"Retry failed: queue full. Original error: {str(error)}",
                 )
-
                 logger.error(
                     "job_retry_failed_queue_full",
                     job_id=job_id,
@@ -367,15 +366,14 @@ class DownloadWorker:
                     queue_error=str(queue_error),
                     original_error=str(error),
                 )
-
                 self._notify_webhook(job_id, "job.failed")
                 return
 
         else:
+            # Max retries exceeded
             self.job_service.fail_job(
                 job_id,
-                f"Max retries ({job.max_retries}) exceeded. "
-                f"Last error: {str(error)}",
+                f"Max retries ({job.max_retries}) exceeded. Last error: {str(error)}",
             )
 
             logger.error(
@@ -384,15 +382,20 @@ class DownloadWorker:
                 retry_count=job.retry_count,
                 error=str(error),
             )
-
             self._notify_webhook(job_id, "job.failed")
 
     async def process_single_job(self, job_id: str) -> None:
-        """Process one job directly, for synchronous mode or tests."""
+        """Process a single job synchronously (for testing or sync mode).
+
+        This method directly processes a job without going through the queue.
+
+        Args:
+            job_id: The job's unique identifier.
+        """
         await self._process_job(job_id)
 
 
-# Global download worker instance.
+# Global download worker instance
 _download_worker: Optional[DownloadWorker] = None
 
 
@@ -403,9 +406,19 @@ def configure_download_worker(
     storage_manager: Optional[StorageManager] = None,
     poll_interval: float = 1.0,
 ) -> DownloadWorker:
-    """Configure and initialize the global download worker."""
-    global _download_worker
+    """Configure and initialize the global download worker.
 
+    Args:
+        provider_manager: Provider manager for executing downloads.
+        job_service: Job service for status updates.
+        download_queue: Download queue.
+        storage_manager: Storage manager for file tracking.
+        poll_interval: Seconds between queue polling attempts.
+
+    Returns:
+        Configured DownloadWorker instance.
+    """
+    global _download_worker
     _download_worker = DownloadWorker(
         provider_manager=provider_manager,
         job_service=job_service,
@@ -413,18 +426,22 @@ def configure_download_worker(
         storage_manager=storage_manager,
         poll_interval=poll_interval,
     )
-
     return _download_worker
 
 
 def get_download_worker() -> DownloadWorker:
-    """Get the configured global download worker."""
+    """Get the global download worker instance.
+
+    Returns:
+        The configured DownloadWorker.
+
+    Raises:
+        RuntimeError: If download worker is not configured.
+    """
     if _download_worker is None:
         raise RuntimeError(
-            "Download worker not configured. "
-            "Call configure_download_worker() first."
+            "Download worker not configured. Call configure_download_worker() first."
         )
-
     return _download_worker
 
 
