@@ -8,8 +8,10 @@ This module implements requirements 11, 30, and 37:
 
 import asyncio
 import os
+import shutil
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Literal
 
 import structlog
@@ -17,32 +19,38 @@ from fastapi import APIRouter, status
 from fastapi.responses import JSONResponse
 
 from app import __version__
-from app.api.schemas import ComponentHealth, HealthResponse, LivenessResponse, ReadinessResponse
+from app.api.schemas import (
+    ComponentHealth,
+    HealthResponse,
+    LivenessResponse,
+    ReadinessResponse,
+)
 from app.core.checks import check_ffmpeg, check_nodejs, check_ytdlp
 from app.core.config import ConfigService
 
 
 def _is_test_mode() -> bool:
     """Check if test mode is enabled via environment variable."""
-    return os.environ.get("APP_TESTING_TEST_MODE", "").lower() in ("true", "1", "yes")
+    return os.environ.get(
+        "APP_TESTING_TEST_MODE", ""
+    ).lower() in ("true", "1", "yes")
 
 
-# Capture test mode at module import time (env var may not be visible in async context)
+# Capture test mode at module import time.
 _TEST_MODE_CACHED = _is_test_mode()
 
 logger = structlog.get_logger(__name__)
-
 router = APIRouter(tags=["health"])
 
-# Track application start time for uptime calculation
+# Track application start time for uptime calculation.
 _start_time: float = time.time()
 
-# Lazily loaded so config (YAML + env) is read once, not on every /health call
+# Lazily loaded and cached from application configuration.
 _health_check_timeout: int | None = None
 
 
 def reset_start_time() -> None:
-    """Reset the start time (for testing)."""
+    """Reset the start time for testing."""
     global _start_time
     _start_time = time.time()
 
@@ -50,34 +58,55 @@ def reset_start_time() -> None:
 async def _check_ytdlp() -> ComponentHealth:
     """Check yt-dlp availability and version."""
     result = await check_ytdlp()
+
     if result.available:
-        return ComponentHealth(status="healthy", version=result.version)
+        return ComponentHealth(
+            status="healthy",
+            version=result.version,
+        )
+
     return ComponentHealth(
         status="unhealthy",
-        details={"error": result.error or "yt-dlp not available"},
+        details={
+            "error": result.error or "yt-dlp not available"
+        },
     )
 
 
 async def _check_ffmpeg() -> ComponentHealth:
-    """Check ffmpeg availability and version."""
+    """Check FFmpeg availability and version."""
     result = await check_ffmpeg()
+
     if result.available:
-        return ComponentHealth(status="healthy", version=result.version)
+        return ComponentHealth(
+            status="healthy",
+            version=result.version,
+        )
+
     return ComponentHealth(
         status="unhealthy",
-        details={"error": result.error or "ffmpeg not available"},
+        details={
+            "error": result.error or "FFmpeg not available"
+        },
     )
 
 
 async def _check_nodejs() -> ComponentHealth:
-    """Check Node.js availability and version."""
-    result = await check_nodejs(min_version=20)
+    """Check that Node.js 22 or newer is available."""
+    result = await check_nodejs(min_version=22)
+
     if result.available:
-        return ComponentHealth(status="healthy", version=result.version)
+        return ComponentHealth(
+            status="healthy",
+            version=result.version,
+        )
+
     return ComponentHealth(
         status="unhealthy",
         version=result.version,
-        details={"error": result.error or "Node.js not available"},
+        details={
+            "error": result.error or "Node.js >= 22 not available"
+        },
     )
 
 
@@ -92,147 +121,289 @@ def _check_storage() -> ComponentHealth:
         return ComponentHealth(
             status="healthy",
             details={
-                "available_gb": round(usage.available / (1024**3), 2),
+                "available_gb": round(
+                    usage.available / (1024**3), 2
+                ),
                 "used_percent": round(usage.percent_used, 1),
             },
         )
+
     except RuntimeError:
-        # Storage manager not configured yet
         return ComponentHealth(
             status="unhealthy",
-            details={"error": "Storage manager not configured"},
+            details={
+                "error": "Storage manager not configured"
+            },
         )
-    except Exception as e:
+
+    except Exception as error:
+        logger.warning(
+            "storage_health_check_failed",
+            error=str(error),
+        )
         return ComponentHealth(
             status="unhealthy",
-            details={"error": str(e)},
+            details={"error": str(error)},
         )
 
 
 def _get_health_check_timeout() -> int:
-    """Get the YouTube connectivity probe timeout, cached after first load."""
+    """Get the configured YouTube connectivity timeout."""
     global _health_check_timeout
+
     if _health_check_timeout is None:
-        _health_check_timeout = ConfigService().load().timeouts.health_check
+        _health_check_timeout = (
+            ConfigService().load().timeouts.health_check
+        )
+
     return _health_check_timeout
 
 
 async def _check_youtube_connectivity() -> ComponentHealth:
-    """Check YouTube connectivity with a lightweight test.
+    """Check YouTube access using configured cookies and Node.js.
 
-    Performs a quick yt-dlp simulation on a known public video
-    to verify YouTube is accessible and the API can communicate
-    with YouTube's servers.
+    Uses a known public YouTube video to test whether yt-dlp can
+    communicate with YouTube.
 
-    Uses "Me at the zoo" (jNQXAC9IVRw) - the first YouTube video ever uploaded,
-    which is unlikely to be removed or made private.
-
-    Timeout: `timeouts.health_check` seconds (APP_TIMEOUTS_HEALTH_CHECK).
+    The configured cookie file and JavaScript runtime are passed
+    explicitly so the probe does not depend solely on yt-dlp's
+    per-user configuration file.
     """
     proc = None
     start_time = time.time()
-    timeout = _get_health_check_timeout()
     test_video_id = "jNQXAC9IVRw"
-    test_url = f"https://www.youtube.com/watch?v={test_video_id}"
+    test_url = (
+        f"https://www.youtube.com/watch?v={test_video_id}"
+    )
 
     try:
-        proc = await asyncio.create_subprocess_exec(
+        config = ConfigService().load()
+        youtube_config = config.providers.youtube
+
+        if not youtube_config.enabled:
+            return ComponentHealth(
+                status="unhealthy",
+                details={
+                    "error": "YouTube provider is disabled"
+                },
+            )
+
+        cookie_path = str(
+            youtube_config.cookie_path or ""
+        ).strip()
+
+        if not cookie_path:
+            return ComponentHealth(
+                status="unhealthy",
+                details={
+                    "error": "No cookie path configured for YouTube"
+                },
+            )
+
+        if not Path(cookie_path).is_file():
+            logger.warning(
+                "youtube_connectivity_cookie_missing",
+                cookie_path=cookie_path,
+            )
+            return ComponentHealth(
+                status="unhealthy",
+                details={
+                    "error": "Configured YouTube cookie file was not found"
+                },
+            )
+
+        node_path = shutil.which("node")
+
+        if not node_path:
+            return ComponentHealth(
+                status="unhealthy",
+                details={
+                    "error": "Node.js runtime not found"
+                },
+            )
+
+        timeout = _get_health_check_timeout()
+
+        # Use the configured cookie file and Node.js executable
+        # explicitly for this YouTube connectivity test.
+        command = [
             "yt-dlp",
             "--simulate",
             "--no-playlist",
             "--skip-download",
+            "--no-warnings",
+            "--js-runtimes",
+            f"node:{node_path}",
+            "--cookies",
+            cookie_path,
             "--print",
             "id",
             test_url,
+        ]
+
+        proc = await asyncio.create_subprocess_exec(
+            *command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=float(timeout))
 
-        latency_ms = int((time.time() - start_time) * 1000)
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(),
+            timeout=float(timeout),
+        )
 
-        if proc.returncode == 0 and test_video_id.encode() in stdout:
+        latency_ms = int(
+            (time.time() - start_time) * 1000
+        )
+
+        if (
+            proc.returncode == 0
+            and test_video_id.encode() in stdout
+        ):
+            logger.info(
+                "youtube_connectivity_check_passed",
+                latency_ms=latency_ms,
+            )
+
             return ComponentHealth(
                 status="healthy",
                 details={"latency_ms": latency_ms},
             )
 
-        # Log stderr server-side for debugging, don't expose to clients
-        if stderr:
-            logger.warning(
-                "youtube_connectivity_check_failed",
-                returncode=proc.returncode,
-                stderr=stderr.decode()[:500],
-            )
+        # Log the diagnostic output for debugging. Do not expose
+        # command arguments, cookie contents, or secrets to clients.
+        stderr_text = stderr.decode(
+            errors="replace"
+        )
+
+        logger.warning(
+            "youtube_connectivity_check_failed",
+            returncode=proc.returncode,
+            stderr=stderr_text[:1000],
+        )
 
         return ComponentHealth(
             status="unhealthy",
-            details={"error": "YouTube connectivity test failed"},
+            details={
+                "error": "YouTube connectivity test failed"
+            },
         )
+
     except asyncio.TimeoutError:
-        if proc:
+        if proc and proc.returncode is None:
             proc.kill()
             await proc.wait()
+
+        logger.warning(
+            "youtube_connectivity_check_timeout",
+            timeout_seconds=_get_health_check_timeout(),
+        )
+
         return ComponentHealth(
             status="unhealthy",
-            details={"error": f"YouTube connectivity test timed out (>{timeout}s)"},
+            details={
+                "error": (
+                    "YouTube connectivity test timed out "
+                    f"(>{_get_health_check_timeout()}s)"
+                )
+            },
         )
+
     except FileNotFoundError:
         return ComponentHealth(
             status="unhealthy",
-            details={"error": "yt-dlp not found for YouTube connectivity test"},
+            details={
+                "error": "yt-dlp or a required executable was not found"
+            },
         )
-    except Exception as e:
+
+    except Exception as error:
+        logger.warning(
+            "youtube_connectivity_check_error",
+            error=str(error),
+        )
+
         return ComponentHealth(
             status="unhealthy",
-            details={"error": f"YouTube connectivity test error: {str(e)}"},
+            details={
+                "error": "YouTube connectivity test encountered an error"
+            },
         )
 
 
 def _check_cookies() -> ComponentHealth:
-    """Check cookie status for providers."""
+    """Check whether configured cookie files are available."""
     try:
-        # Import from main to get the configured cookie service
         from app.main import get_cookie_service
 
         cookie_service = get_cookie_service()
-        providers = cookie_service.list_providers_with_cookies()
+        providers = (
+            cookie_service.list_providers_with_cookies()
+        )
 
         if not providers:
             return ComponentHealth(
                 status="unhealthy",
-                details={"error": "No cookie files configured"},
+                details={
+                    "error": "No cookie files configured"
+                },
             )
 
-        # Check if any provider has valid cookies
-        healthy_providers = [p for p, info in providers.items() if info.get("exists", False)]
+        healthy_providers = [
+            provider
+            for provider, info in providers.items()
+            if info.get("exists", False)
+        ]
 
         if healthy_providers:
             details: Dict[str, Any] = {}
+
             for provider, info in providers.items():
                 details[provider] = {
                     "exists": info.get("exists", False),
                     "age_hours": info.get("age_hours"),
                 }
-                if info.get("age_hours") and info["age_hours"] > 168:  # 7 days
-                    details[provider]["warning"] = "Cookie file is older than 7 days"
 
-            return ComponentHealth(status="healthy", details=details)
+                age_hours = info.get("age_hours")
+
+                if (
+                    age_hours is not None
+                    and age_hours > 168
+                ):
+                    details[provider]["warning"] = (
+                        "Cookie file is older than 7 days"
+                    )
+
+            return ComponentHealth(
+                status="healthy",
+                details=details,
+            )
 
         return ComponentHealth(
             status="unhealthy",
-            details={"error": "No valid cookie files found", "providers": providers},
+            details={
+                "error": "No valid cookie files found",
+                "providers": providers,
+            },
         )
+
     except RuntimeError:
-        # Cookie service not configured yet
         return ComponentHealth(
             status="unhealthy",
-            details={"error": "Cookie service not configured"},
+            details={
+                "error": "Cookie service not configured"
+            },
         )
-    except Exception as e:
+
+    except Exception as error:
+        logger.warning(
+            "cookie_health_check_failed",
+            error=str(error),
+        )
+
         return ComponentHealth(
             status="unhealthy",
-            details={"error": str(e)},
+            details={"error": str(error)},
         )
 
 
@@ -241,35 +412,30 @@ def _check_cookies() -> ComponentHealth:
     response_model=HealthResponse,
     responses={
         200: {"description": "All components healthy"},
-        503: {"description": "One or more components unhealthy"},
+        503: {
+            "description": "One or more components unhealthy"
+        },
     },
 )
 async def health_check() -> JSONResponse:
+    """Return detailed health status for the application.
+
+    Verifies yt-dlp, FFmpeg, Node.js, storage, cookie files,
+    and YouTube connectivity.
     """
-    Detailed health check endpoint.
-
-    Verifies all system components:
-    - yt-dlp availability and version
-    - ffmpeg availability and version
-    - Node.js >= 20 availability
-    - Cookie file status
-    - Storage availability
-    - YouTube connectivity (timeouts.health_check, default 10s)
-
-    Returns HTTP 200 if all components are healthy,
-    HTTP 503 if any component is unhealthy.
-    """
-    # Run all async checks concurrently
-    ytdlp_task = _check_ytdlp()
-    ffmpeg_task = _check_ffmpeg()
-    nodejs_task = _check_nodejs()
-    youtube_task = _check_youtube_connectivity()
-
-    ytdlp_health, ffmpeg_health, nodejs_health, youtube_health = await asyncio.gather(
-        ytdlp_task, ffmpeg_task, nodejs_task, youtube_task
+    # Run independent asynchronous checks concurrently.
+    (
+        ytdlp_health,
+        ffmpeg_health,
+        nodejs_health,
+        youtube_health,
+    ) = await asyncio.gather(
+        _check_ytdlp(),
+        _check_ffmpeg(),
+        _check_nodejs(),
+        _check_youtube_connectivity(),
     )
 
-    # These are sync checks
     storage_health = _check_storage()
     cookie_health = _check_cookies()
 
@@ -282,41 +448,53 @@ async def health_check() -> JSONResponse:
         "youtube_connectivity": youtube_health,
     }
 
-    # Determine overall status
-    all_healthy = all(c.status == "healthy" for c in components.values())
-    overall_status: Literal["healthy", "unhealthy"] = "healthy" if all_healthy else "unhealthy"
+    all_healthy = all(
+        component.status == "healthy"
+        for component in components.values()
+    )
 
-    uptime = time.time() - _start_time
+    overall_status: Literal["healthy", "unhealthy"] = (
+        "healthy" if all_healthy else "unhealthy"
+    )
 
     response = HealthResponse(
         status=overall_status,
         timestamp=datetime.now(timezone.utc).isoformat(),
         version=__version__,
-        uptime_seconds=round(uptime, 2),
+        uptime_seconds=round(
+            time.time() - _start_time, 2
+        ),
         test_mode=_TEST_MODE_CACHED,
         components=components,
     )
 
-    status_code = status.HTTP_200_OK if all_healthy else status.HTTP_503_SERVICE_UNAVAILABLE
+    status_code = (
+        status.HTTP_200_OK
+        if all_healthy
+        else status.HTTP_503_SERVICE_UNAVAILABLE
+    )
 
     logger.info(
         "health_check_completed",
         status=overall_status,
-        components={k: v.status for k, v in components.items()},
+        components={
+            name: component.status
+            for name, component in components.items()
+        },
     )
 
-    return JSONResponse(content=response.model_dump(), status_code=status_code)
+    return JSONResponse(
+        content=response.model_dump(),
+        status_code=status_code,
+    )
 
 
-@router.get("/liveness", response_model=LivenessResponse)
+@router.get(
+    "/liveness",
+    response_model=LivenessResponse,
+)
 async def liveness_check() -> LivenessResponse:
-    """
-    Liveness probe endpoint.
-
-    Returns HTTP 200 if the process is alive.
-    Used by container orchestration to determine if the container
-    should be restarted.
-    """
+    """Return whether the application process is alive."""
     return LivenessResponse(status="alive")
 
 
@@ -324,31 +502,28 @@ async def liveness_check() -> LivenessResponse:
     "/readiness",
     response_model=ReadinessResponse,
     responses={
-        200: {"description": "Service is ready to accept traffic"},
-        503: {"description": "Service is not ready"},
+        200: {
+            "description": "Service is ready to accept traffic"
+        },
+        503: {
+            "description": "Service is not ready"
+        },
     },
 )
 async def readiness_check() -> JSONResponse:
-    """
-    Readiness probe endpoint.
+    """Check whether the service is ready to accept traffic.
 
-    Returns HTTP 200 if the service is ready to accept traffic.
-    Used by load balancers to determine if traffic should be routed
-    to this instance.
-
-    Checks:
-    - yt-dlp is available
-    - Storage manager is configured
+    Readiness requires yt-dlp and storage to be available.
     """
     issues = []
 
-    # Quick yt-dlp check
     ytdlp_health = await _check_ytdlp()
+
     if ytdlp_health.status != "healthy":
         issues.append("yt-dlp not available")
 
-    # Quick storage check
     storage_health = _check_storage()
+
     if storage_health.status != "healthy":
         issues.append("Storage not ready")
 
@@ -358,12 +533,16 @@ async def readiness_check() -> JSONResponse:
             ready=False,
             message="; ".join(issues),
         )
+
         return JSONResponse(
             content=response.model_dump(),
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
 
     return JSONResponse(
-        content=ReadinessResponse(status="ready", ready=True).model_dump(),
+        content=ReadinessResponse(
+            status="ready",
+            ready=True,
+        ).model_dump(),
         status_code=status.HTTP_200_OK,
     )
