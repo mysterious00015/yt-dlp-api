@@ -1,3 +1,4 @@
+
 """Shared component check utilities.
 
 This module provides reusable async functions for checking external
@@ -56,40 +57,60 @@ async def _run_binary_check(
         CheckResult with availability status.
     """
     proc = None
+
     try:
         proc = await asyncio.create_subprocess_exec(
             *command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+
+        stdout, _ = await asyncio.wait_for(
+            proc.communicate(),
+            timeout=timeout,
+        )
 
         if proc.returncode == 0:
             success, version, error = parse_output(stdout)
+
             if success:
-                return CheckResult(name=name, available=True, version=version)
-            return CheckResult(name=name, available=False, version=version, error=error)
+                return CheckResult(
+                    name=name,
+                    available=True,
+                    version=version,
+                )
+
+            return CheckResult(
+                name=name,
+                available=False,
+                version=version,
+                error=error,
+            )
 
         return CheckResult(
             name=name,
             available=False,
             error=f"{command[0]} returned non-zero exit code",
         )
+
     except asyncio.TimeoutError:
-        if proc:
+        if proc and proc.returncode is None:
             proc.kill()
             await proc.wait()
+
         return CheckResult(
             name=name,
             available=False,
             error=f"{command[0]} check timed out",
         )
+
     except FileNotFoundError:
         return CheckResult(
             name=name,
             available=False,
             error=f"{command[0]} not found",
         )
+
     except Exception as e:
         return CheckResult(
             name=name,
@@ -98,7 +119,7 @@ async def _run_binary_check(
         )
 
 
-async def check_ytdlp(timeout: float = 5.0) -> CheckResult:
+async def check_ytdlp(timeout: float = 30.0) -> CheckResult:
     """Check yt-dlp availability and version.
 
     Args:
@@ -108,7 +129,9 @@ async def check_ytdlp(timeout: float = 5.0) -> CheckResult:
         CheckResult with availability status and version if available.
     """
 
-    def parse_version(stdout: bytes) -> Tuple[bool, Optional[str], Optional[str]]:
+    def parse_version(
+        stdout: bytes,
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
         version = stdout.decode().strip()
         return True, version, None
 
@@ -130,7 +153,9 @@ async def check_ffmpeg(timeout: float = 5.0) -> CheckResult:
         CheckResult with availability status and version if available.
     """
 
-    def parse_version(stdout: bytes) -> Tuple[bool, Optional[str], Optional[str]]:
+    def parse_version(
+        stdout: bytes,
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
         output = stdout.decode()
         match = re.search(r"ffmpeg version (\S+)", output)
         version = match.group(1) if match else "unknown"
@@ -144,7 +169,10 @@ async def check_ffmpeg(timeout: float = 5.0) -> CheckResult:
     )
 
 
-async def check_nodejs(min_version: int = 20, timeout: float = 5.0) -> CheckResult:
+async def check_nodejs(
+    min_version: int = 20,
+    timeout: float = 5.0,
+) -> CheckResult:
     """Check Node.js availability and version.
 
     Args:
@@ -156,17 +184,28 @@ async def check_nodejs(min_version: int = 20, timeout: float = 5.0) -> CheckResu
         Node.js is not installed or version is below min_version.
     """
 
-    def parse_version(stdout: bytes) -> Tuple[bool, Optional[str], Optional[str]]:
+    def parse_version(
+        stdout: bytes,
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
         version = stdout.decode().strip()
+
         try:
             major_version = int(version.lstrip("v").split(".")[0])
         except (ValueError, IndexError):
-            return False, version, f"Unable to parse Node.js version: {version}"
+            return (
+                False,
+                version,
+                f"Unable to parse Node.js version: {version}",
+            )
 
         if major_version >= min_version:
             return True, version, None
 
-        return False, version, f"Node.js >= {min_version} required, found {version}"
+        return (
+            False,
+            version,
+            f"Node.js >= {min_version} required, found {version}",
+        )
 
     return await _run_binary_check(
         name="nodejs",
