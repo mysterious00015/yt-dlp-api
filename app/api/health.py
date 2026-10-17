@@ -10,6 +10,7 @@ This module implements requirements 11, 30, and 37:
 import asyncio
 import os
 import shutil
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -161,11 +162,10 @@ def _get_health_check_timeout() -> int:
 
 
 def _get_ytdlp_js_runtime() -> tuple[str, str] | None:
-    """Prefer Deno for yt-dlp JavaScript challenges, then fall back to Node.
+    """Prefer Deno for yt-dlp JavaScript challenges, then Node.js.
 
     Returns:
-        A tuple containing the runtime name and executable path,
-        or None when neither supported runtime is available.
+        Runtime name and executable path, or None if neither is available.
     """
     deno_path = shutil.which("deno")
 
@@ -183,15 +183,17 @@ def _get_ytdlp_js_runtime() -> tuple[str, str] | None:
 async def _check_youtube_connectivity() -> ComponentHealth:
     """Check YouTube access using configured cookies and a JS runtime.
 
-    The connectivity test uses a known public YouTube video. It explicitly
-    supplies the configured cookie path and JavaScript runtime.
+    Render secret files are read-only. A private, writable temporary
+    cookie copy is used because yt-dlp may update the cookie jar.
 
-    Diagnostic output is written to server logs and is not returned
-    directly to API clients.
+    Diagnostic output is logged server-side. Cookie contents and
+    authentication secrets are not returned to API clients.
     """
     proc = None
     communicate_task = None
+    writable_cookie_path = None
     start_time = time.time()
+
     test_video_id = "jNQXAC9IVRw"
     test_url = f"https://www.youtube.com/watch?v={test_video_id}"
 
@@ -222,7 +224,9 @@ async def _check_youtube_connectivity() -> ComponentHealth:
         cookie_file = Path(cookie_path)
 
         if not cookie_file.is_file():
-            logger.warning("youtube_connectivity_cookie_missing")
+            logger.warning(
+                "youtube_connectivity_cookie_missing"
+            )
 
             return ComponentHealth(
                 status="unhealthy",
@@ -234,7 +238,9 @@ async def _check_youtube_connectivity() -> ComponentHealth:
         runtime = _get_ytdlp_js_runtime()
 
         if runtime is None:
-            logger.warning("youtube_js_runtime_not_found")
+            logger.warning(
+                "youtube_js_runtime_not_found"
+            )
 
             return ComponentHealth(
                 status="unhealthy",
@@ -242,6 +248,23 @@ async def _check_youtube_connectivity() -> ComponentHealth:
                     "error": "Neither Deno nor Node.js was found"
                 },
             )
+
+        # Render Secret Files are read-only. Copy the cookie jar into a
+        # writable temporary file owned by the running application user.
+        fd, writable_cookie_path = tempfile.mkstemp(
+            prefix="youtube-cookies-",
+            suffix=".txt",
+        )
+        os.close(fd)
+
+        shutil.copyfile(
+            cookie_file,
+            writable_cookie_path,
+        )
+        os.chmod(
+            writable_cookie_path,
+            0o600,
+        )
 
         runtime_name, runtime_path = runtime
         timeout = _get_health_check_timeout()
@@ -267,7 +290,7 @@ async def _check_youtube_connectivity() -> ComponentHealth:
             "--js-runtimes",
             f"{runtime_name}:{runtime_path}",
             "--cookies",
-            str(cookie_file),
+            writable_cookie_path,
             "--print",
             "id",
             test_url,
@@ -279,7 +302,9 @@ async def _check_youtube_connectivity() -> ComponentHealth:
             stderr=asyncio.subprocess.PIPE,
         )
 
-        communicate_task = asyncio.create_task(proc.communicate())
+        communicate_task = asyncio.create_task(
+            proc.communicate()
+        )
 
         try:
             stdout, stderr = await asyncio.wait_for(
@@ -288,7 +313,7 @@ async def _check_youtube_connectivity() -> ComponentHealth:
             )
 
         except asyncio.TimeoutError:
-            # Stop the subprocess before collecting its available output.
+            # Terminate the process and attempt to capture diagnostic output.
             if proc.returncode is None:
                 proc.kill()
 
@@ -305,14 +330,18 @@ async def _check_youtube_connectivity() -> ComponentHealth:
                     error=str(capture_error),
                 )
 
-            # These logs may contain URLs and diagnostic information.
-            # Never log the command line or cookie contents.
+            # Log only a bounded amount of output; never log the command
+            # arguments or the contents of the cookie file.
             logger.warning(
                 "youtube_connectivity_check_timeout",
                 js_runtime=runtime_name,
                 timeout_seconds=timeout,
-                stdout=stdout.decode(errors="replace")[-500:],
-                stderr=stderr.decode(errors="replace")[-1500:],
+                stdout=stdout.decode(
+                    errors="replace"
+                )[-500:],
+                stderr=stderr.decode(
+                    errors="replace"
+                )[-1500:],
             )
 
             return ComponentHealth(
@@ -325,7 +354,9 @@ async def _check_youtube_connectivity() -> ComponentHealth:
                 },
             )
 
-        latency_ms = int((time.time() - start_time) * 1000)
+        latency_ms = int(
+            (time.time() - start_time) * 1000
+        )
 
         if (
             proc.returncode == 0
@@ -345,7 +376,9 @@ async def _check_youtube_connectivity() -> ComponentHealth:
                 },
             )
 
-        stderr_text = stderr.decode(errors="replace")
+        stderr_text = stderr.decode(
+            errors="replace"
+        )
 
         logger.warning(
             "youtube_connectivity_check_failed",
@@ -385,7 +418,7 @@ async def _check_youtube_connectivity() -> ComponentHealth:
         )
 
     finally:
-        # Ensure an unfinished subprocess cannot be left running.
+        # Ensure no subprocess is left running after a failure or cancellation.
         if proc is not None and proc.returncode is None:
             proc.kill()
 
@@ -397,7 +430,6 @@ async def _check_youtube_connectivity() -> ComponentHealth:
             except Exception:
                 pass
 
-        # Clean up any pending communication task.
         if (
             communicate_task is not None
             and not communicate_task.done()
@@ -411,6 +443,18 @@ async def _check_youtube_connectivity() -> ComponentHealth:
             except Exception:
                 pass
 
+        # Always remove the temporary writable cookie copy.
+        if writable_cookie_path:
+            try:
+                Path(writable_cookie_path).unlink(
+                    missing_ok=True
+                )
+            except OSError as cleanup_error:
+                logger.warning(
+                    "youtube_temporary_cookie_cleanup_failed",
+                    error=str(cleanup_error),
+                )
+
 
 def _check_cookies() -> ComponentHealth:
     """Check whether configured cookie files are available."""
@@ -418,7 +462,9 @@ def _check_cookies() -> ComponentHealth:
         from app.main import get_cookie_service
 
         cookie_service = get_cookie_service()
-        providers = cookie_service.list_providers_with_cookies()
+        providers = (
+            cookie_service.list_providers_with_cookies()
+        )
 
         if not providers:
             return ComponentHealth(
@@ -499,7 +545,7 @@ def _check_cookies() -> ComponentHealth:
 async def health_check() -> JSONResponse:
     """Return detailed application health information.
 
-    Checks yt-dlp, FFmpeg, Node.js, storage, cookies,
+    Checks yt-dlp, FFmpeg, Node.js, storage, cookie files,
     and YouTube connectivity.
     """
     (
@@ -539,7 +585,9 @@ async def health_check() -> JSONResponse:
         status=overall_status,
         timestamp=datetime.now(timezone.utc).isoformat(),
         version=__version__,
-        uptime_seconds=round(time.time() - _start_time, 2),
+        uptime_seconds=round(
+            time.time() - _start_time, 2
+        ),
         test_mode=_TEST_MODE_CACHED,
         components=components,
     )
