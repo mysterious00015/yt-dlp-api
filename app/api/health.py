@@ -228,18 +228,25 @@ async def _check_youtube_connectivity() -> ComponentHealth:
         timeout = _get_health_check_timeout()
 
         command = [
-            "yt-dlp",
-            "--simulate",
-            "--no-playlist",
-            "--skip-download",
-            "--js-runtimes",
-            f"node:{node_path}",
-            "--cookies",
-            str(cookie_file),
-            "--print",
-            "id",
-            test_url,
-        ]
+    "yt-dlp",
+    "--verbose",
+    "--socket-timeout",
+    "10",
+    "--retries",
+    "0",
+    "--extractor-retries",
+    "0",
+    "--simulate",
+    "--no-playlist",
+    "--skip-download",
+    "--js-runtimes",
+    f"node:{node_path}",
+    "--cookies",
+    str(cookie_file),
+    "--print",
+    "id",
+    test_url,
+]
 
         proc = await asyncio.create_subprocess_exec(
             *command,
