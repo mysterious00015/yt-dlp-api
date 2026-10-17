@@ -18,12 +18,7 @@ class ProviderManager:
         self._providers: Dict[str, VideoProvider] = {}
         self._enabled_providers: Dict[str, bool] = {}
 
-    def register_provider(
-        self,
-        name: str,
-        provider: VideoProvider,
-        enabled: bool = True,
-    ) -> None:
+    def register_provider(self, name: str, provider: VideoProvider, enabled: bool = True) -> None:
         """
         Register a video provider.
 
@@ -101,21 +96,12 @@ class ProviderManager:
 
             try:
                 if provider.validate_url(url):
-                    logger.debug(
-                        "Provider selected for URL",
-                        provider=name,
-                        url=url,
-                    )
+                    logger.debug("Provider selected for URL", provider=name, url=url)
                     return provider
             except Exception as e:
                 # Isolate provider errors - don't let one provider's
                 # validation error prevent checking other providers
-                logger.warning(
-                    "Provider validation error",
-                    provider=name,
-                    url=url,
-                    error=str(e),
-                )
+                logger.warning("Provider validation error", provider=name, url=url, error=str(e))
                 continue
 
         # No provider found
@@ -124,10 +110,7 @@ class ProviderManager:
             "Ensure the URL is from a supported platform and the provider is enabled."
         )
 
-    def get_provider_by_name(
-        self,
-        name: str,
-    ) -> Optional[VideoProvider]:
+    def get_provider_by_name(self, name: str) -> Optional[VideoProvider]:
         """
         Get a provider by name.
 
@@ -146,17 +129,10 @@ class ProviderManager:
         Returns:
             Dictionary mapping provider names to enabled status
         """
-        return {
-            name: self._enabled_providers.get(name, False)
-            for name in self._providers.keys()
-        }
+        return {name: self._enabled_providers.get(name, False) for name in self._providers.keys()}
 
     async def execute_with_error_isolation(
-        self,
-        provider_name: str,
-        operation: Callable[..., Any],
-        *args: Any,
-        **kwargs: Any,
+        self, provider_name: str, operation: Callable[..., Any], *args: Any, **kwargs: Any
     ) -> Any:
         """
         Execute a provider operation with error isolation.
@@ -177,17 +153,13 @@ class ProviderManager:
         """
         try:
             logger.debug(
-                "Executing provider operation",
-                provider=provider_name,
-                operation=operation.__name__,
+                "Executing provider operation", provider=provider_name, operation=operation.__name__
             )
 
             result = await operation(*args, **kwargs)
 
             logger.debug(
-                "Provider operation completed",
-                provider=provider_name,
-                operation=operation.__name__,
+                "Provider operation completed", provider=provider_name, operation=operation.__name__
             )
 
             return result
@@ -205,7 +177,6 @@ class ProviderManager:
                 error=str(e),
                 exc_info=True,
             )
-
             raise ProviderError(
                 f"Provider '{provider_name}' encountered an unexpected error: {str(e)}"
             ) from e
