@@ -121,7 +121,7 @@ RUN python --version \
 # Container health check
 # =============================================================================
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-    CMD curl --fail --silent http://localhost:${APP_SERVER_PORT}/health || exit 1
+    CMD curl --fail --silent http://localhost:${APP_SERVER_PORT}/liveness || exit 1
 
 
 # =============================================================================
