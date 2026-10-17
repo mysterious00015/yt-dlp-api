@@ -54,6 +54,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     curl \
+    unzip \
     gnupg \
     ca-certificates \
     && mkdir -p /etc/apt/keyrings \
