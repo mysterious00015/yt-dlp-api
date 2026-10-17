@@ -45,7 +45,7 @@ router = APIRouter(tags=["health"])
 # Track application start time for uptime calculation.
 _start_time: float = time.time()
 
-# Lazily loaded and cached from application configuration.
+# Lazily load the configured YouTube health-check timeout.
 _health_check_timeout: int | None = None
 
 
@@ -162,19 +162,18 @@ def _get_health_check_timeout() -> int:
 async def _check_youtube_connectivity() -> ComponentHealth:
     """Check YouTube access using configured cookies and Node.js.
 
-    Uses a known public YouTube video to test whether yt-dlp can
-    communicate with YouTube.
+    Uses a known public video to check whether yt-dlp can communicate
+    with YouTube. The configured cookie file and Node.js runtime are
+    passed explicitly to the subprocess.
 
-    The configured cookie file and JavaScript runtime are passed
-    explicitly so the probe does not depend solely on yt-dlp's
-    per-user configuration file.
+    Detailed subprocess output is logged server-side for troubleshooting.
+    Cookie contents and secrets are never returned by this endpoint.
     """
     proc = None
+    communicate_task = None
     start_time = time.time()
     test_video_id = "jNQXAC9IVRw"
-    test_url = (
-        f"https://www.youtube.com/watch?v={test_video_id}"
-    )
+    test_url = f"https://www.youtube.com/watch?v={test_video_id}"
 
     try:
         config = ConfigService().load()
@@ -200,7 +199,9 @@ async def _check_youtube_connectivity() -> ComponentHealth:
                 },
             )
 
-        if not Path(cookie_path).is_file():
+        cookie_file = Path(cookie_path)
+
+        if not cookie_file.is_file():
             logger.warning(
                 "youtube_connectivity_cookie_missing",
                 cookie_path=cookie_path,
@@ -208,7 +209,9 @@ async def _check_youtube_connectivity() -> ComponentHealth:
             return ComponentHealth(
                 status="unhealthy",
                 details={
-                    "error": "Configured YouTube cookie file was not found"
+                    "error": (
+                        "Configured YouTube cookie file was not found"
+                    )
                 },
             )
 
@@ -224,18 +227,15 @@ async def _check_youtube_connectivity() -> ComponentHealth:
 
         timeout = _get_health_check_timeout()
 
-        # Use the configured cookie file and Node.js executable
-        # explicitly for this YouTube connectivity test.
         command = [
             "yt-dlp",
             "--simulate",
             "--no-playlist",
             "--skip-download",
-            "--no-warnings",
             "--js-runtimes",
             f"node:{node_path}",
             "--cookies",
-            cookie_path,
+            str(cookie_file),
             "--print",
             "id",
             test_url,
@@ -247,44 +247,57 @@ async def _check_youtube_connectivity() -> ComponentHealth:
             stderr=asyncio.subprocess.PIPE,
         )
 
-        communicate_task = asyncio.create_task(proc.communicate())
-
-try:
-    stdout, stderr = await asyncio.wait_for(
-        asyncio.shield(communicate_task),
-        timeout=float(timeout),
-    )
-except asyncio.TimeoutError:
-    if proc.returncode is None:
-        proc.kill()
-
-    try:
-        stdout, stderr = await asyncio.wait_for(
-            communicate_task,
-            timeout=3.0,
-        )
-    except Exception as capture_error:
-        stdout, stderr = b"", b""
-        logger.warning(
-            "youtube_timeout_output_capture_failed",
-            error=str(capture_error),
+        communicate_task = asyncio.create_task(
+            proc.communicate()
         )
 
-    logger.warning(
-        "youtube_connectivity_check_timeout",
-        timeout_seconds=timeout,
-        stdout=stdout.decode(errors="replace")[-500:],
-        stderr=stderr.decode(errors="replace")[-1500:],
-    )
-
-    return ComponentHealth(
-        status="unhealthy",
-        details={
-            "error": (
-                f"YouTube connectivity test timed out (>{timeout}s)"
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                asyncio.shield(communicate_task),
+                timeout=float(timeout),
             )
-        },
-    )
+
+        except asyncio.TimeoutError:
+            # Terminate the stuck process and try to collect any output.
+            if proc.returncode is None:
+                proc.kill()
+
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    communicate_task,
+                    timeout=3.0,
+                )
+            except Exception as capture_error:
+                stdout, stderr = b"", b""
+
+                logger.warning(
+                    "youtube_timeout_output_capture_failed",
+                    error=str(capture_error),
+                )
+
+            # Output is written only to server logs, not the HTTP response.
+            # Avoid logging the command line or cookie contents.
+            logger.warning(
+                "youtube_connectivity_check_timeout",
+                timeout_seconds=timeout,
+                stdout=stdout.decode(
+                    errors="replace"
+                )[-500:],
+                stderr=stderr.decode(
+                    errors="replace"
+                )[-1500:],
+            )
+
+            return ComponentHealth(
+                status="unhealthy",
+                details={
+                    "error": (
+                        "YouTube connectivity test timed out "
+                        f"(>{timeout}s)"
+                    )
+                },
+            )
+
         latency_ms = int(
             (time.time() - start_time) * 1000
         )
@@ -303,8 +316,6 @@ except asyncio.TimeoutError:
                 details={"latency_ms": latency_ms},
             )
 
-        # Log the diagnostic output for debugging. Do not expose
-        # command arguments, cookie contents, or secrets to clients.
         stderr_text = stderr.decode(
             errors="replace"
         )
@@ -312,7 +323,7 @@ except asyncio.TimeoutError:
         logger.warning(
             "youtube_connectivity_check_failed",
             returncode=proc.returncode,
-            stderr=stderr_text[:1000],
+            stderr=stderr_text[-1500:],
         )
 
         return ComponentHealth(
@@ -322,31 +333,13 @@ except asyncio.TimeoutError:
             },
         )
 
-    except asyncio.TimeoutError:
-        if proc and proc.returncode is None:
-            proc.kill()
-            await proc.wait()
-
-        logger.warning(
-            "youtube_connectivity_check_timeout",
-            timeout_seconds=_get_health_check_timeout(),
-        )
-
-        return ComponentHealth(
-            status="unhealthy",
-            details={
-                "error": (
-                    "YouTube connectivity test timed out "
-                    f"(>{_get_health_check_timeout()}s)"
-                )
-            },
-        )
-
     except FileNotFoundError:
         return ComponentHealth(
             status="unhealthy",
             details={
-                "error": "yt-dlp or a required executable was not found"
+                "error": (
+                    "yt-dlp or a required executable was not found"
+                )
             },
         )
 
@@ -359,9 +352,33 @@ except asyncio.TimeoutError:
         return ComponentHealth(
             status="unhealthy",
             details={
-                "error": "YouTube connectivity test encountered an error"
+                "error": (
+                    "YouTube connectivity test encountered an error"
+                )
             },
         )
+
+    finally:
+        # Avoid leaving a subprocess or communication task behind.
+        if proc is not None and proc.returncode is None:
+            proc.kill()
+            try:
+                await asyncio.wait_for(
+                    proc.wait(),
+                    timeout=3.0,
+                )
+            except Exception:
+                pass
+
+        if (
+            communicate_task is not None
+            and not communicate_task.done()
+        ):
+            communicate_task.cancel()
+            try:
+                await communicate_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 def _check_cookies() -> ComponentHealth:
@@ -453,10 +470,9 @@ def _check_cookies() -> ComponentHealth:
 async def health_check() -> JSONResponse:
     """Return detailed health status for the application.
 
-    Verifies yt-dlp, FFmpeg, Node.js, storage, cookie files,
+    Checks yt-dlp, FFmpeg, Node.js, storage, cookie files,
     and YouTube connectivity.
     """
-    # Run independent asynchronous checks concurrently.
     (
         ytdlp_health,
         ffmpeg_health,
