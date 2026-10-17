@@ -1,4 +1,3 @@
-
 # syntax=docker/dockerfile:1
 # Multi-stage Dockerfile for yt-dlp REST API
 
@@ -50,7 +49,7 @@ WORKDIR /app
 
 
 # =============================================================================
-# Install FFmpeg and Node.js 22
+# Install FFmpeg, Node.js 22, and required system packages
 # =============================================================================
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
@@ -73,14 +72,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
              /etc/apt/sources.list.d/nodesource.list
 
 
-# Install Deno, the recommended JavaScript runtime for yt-dlp EJS
+# =============================================================================
+# Install Deno for yt-dlp JavaScript challenge resolution
+# =============================================================================
 RUN curl -fsSL https://deno.land/install.sh \
     | DENO_INSTALL=/usr/local sh -s -- -y \
-    && deno --version
+    && test -x /usr/local/bin/deno \
+    && /usr/local/bin/deno --version
 
 
 # =============================================================================
-# Create non-root user
+# Create non-root application user
 # =============================================================================
 RUN useradd --create-home --uid 1000 --shell /bin/bash appuser
 
@@ -102,12 +104,13 @@ COPY --chown=appuser:appuser requirements.txt /app/requirements.txt
 
 
 # =============================================================================
-# Switch user BEFORE verifying user-installed Python packages
+# Switch user and verify runtime dependencies
 # =============================================================================
 USER appuser
 
 RUN python --version \
     && node --version \
+    && deno --version \
     && python -m yt_dlp --version \
     && yt-dlp --version \
     && ffmpeg -version
