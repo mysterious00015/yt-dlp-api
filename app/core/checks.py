@@ -5,7 +5,7 @@ dependencies like yt-dlp, ffmpeg, and Node.js. Used by both the
 startup validator and health check endpoints.
 
 Implements requirements:
-- Req 10: JavaScript Challenge Resolution (Node.js >= 20)
+- Req 10: JavaScript Challenge Resolution (Node.js >= 22)
 - Req 11: Health monitoring with component verification
 """
 
@@ -42,54 +42,70 @@ async def _run_binary_check(
 ) -> CheckResult:
     """Run a binary availability check with common error handling.
 
-    This helper function handles the boilerplate of running a subprocess
-    and catching common exceptions (timeout, file not found, etc.).
-
     Args:
-        name: Component name for the result (e.g., "ytdlp", "ffmpeg").
+        name: Component name for the result.
         command: Command and arguments to execute.
         timeout: Maximum time to wait in seconds.
-        parse_output: Callback to parse stdout and determine success.
-            Should return (success, version, error_message).
+        parse_output: Callback returning (success, version, error_message).
 
     Returns:
         CheckResult with availability status.
     """
     proc = None
+
     try:
         proc = await asyncio.create_subprocess_exec(
             *command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+
+        stdout, _ = await asyncio.wait_for(
+            proc.communicate(),
+            timeout=timeout,
+        )
 
         if proc.returncode == 0:
             success, version, error = parse_output(stdout)
+
             if success:
-                return CheckResult(name=name, available=True, version=version)
-            return CheckResult(name=name, available=False, version=version, error=error)
+                return CheckResult(
+                    name=name,
+                    available=True,
+                    version=version,
+                )
+
+            return CheckResult(
+                name=name,
+                available=False,
+                version=version,
+                error=error,
+            )
 
         return CheckResult(
             name=name,
             available=False,
             error=f"{command[0]} returned non-zero exit code",
         )
+
     except asyncio.TimeoutError:
-        if proc:
+        if proc and proc.returncode is None:
             proc.kill()
             await proc.wait()
+
         return CheckResult(
             name=name,
             available=False,
-            error=f"{command[0]} check timed out",
+            error=f"{command[0]} check timed out after {timeout:g} seconds",
         )
+
     except FileNotFoundError:
         return CheckResult(
             name=name,
             available=False,
             error=f"{command[0]} not found",
         )
+
     except Exception as e:
         return CheckResult(
             name=name,
@@ -98,8 +114,11 @@ async def _run_binary_check(
         )
 
 
-async def check_ytdlp(timeout: float = 5.0) -> CheckResult:
+async def check_ytdlp(timeout: float = 30.0) -> CheckResult:
     """Check yt-dlp availability and version.
+
+    The default timeout is 30 seconds to accommodate slower startup
+    environments.
 
     Args:
         timeout: Maximum time to wait for the check in seconds.
@@ -108,8 +127,12 @@ async def check_ytdlp(timeout: float = 5.0) -> CheckResult:
         CheckResult with availability status and version if available.
     """
 
-    def parse_version(stdout: bytes) -> Tuple[bool, Optional[str], Optional[str]]:
-        version = stdout.decode().strip()
+    def parse_version(
+        stdout: bytes,
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
+        version = stdout.decode(errors="replace").strip()
+        if not version:
+            return False, version, "yt-dlp returned an empty version"
         return True, version, None
 
     return await _run_binary_check(
@@ -130,8 +153,10 @@ async def check_ffmpeg(timeout: float = 5.0) -> CheckResult:
         CheckResult with availability status and version if available.
     """
 
-    def parse_version(stdout: bytes) -> Tuple[bool, Optional[str], Optional[str]]:
-        output = stdout.decode()
+    def parse_version(
+        stdout: bytes,
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
+        output = stdout.decode(errors="replace")
         match = re.search(r"ffmpeg version (\S+)", output)
         version = match.group(1) if match else "unknown"
         return True, version, None
@@ -144,29 +169,43 @@ async def check_ffmpeg(timeout: float = 5.0) -> CheckResult:
     )
 
 
-async def check_nodejs(min_version: int = 22, timeout: float = 5.0) -> CheckResult:
+async def check_nodejs(
+    min_version: int = 22,
+    timeout: float = 5.0,
+) -> CheckResult:
     """Check Node.js availability and version.
 
     Args:
-        min_version: Minimum required major version (default: 20).
+        min_version: Minimum required major version (default: 22).
         timeout: Maximum time to wait for the check in seconds.
 
     Returns:
-        CheckResult with availability status. available=False if
-        Node.js is not installed or version is below min_version.
+        CheckResult with availability status. available=False if Node.js
+        is missing, its version cannot be parsed, or it is below min_version.
     """
 
-    def parse_version(stdout: bytes) -> Tuple[bool, Optional[str], Optional[str]]:
-        version = stdout.decode().strip()
+    def parse_version(
+        stdout: bytes,
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
+        version = stdout.decode(errors="replace").strip()
+
         try:
             major_version = int(version.lstrip("v").split(".")[0])
         except (ValueError, IndexError):
-            return False, version, f"Unable to parse Node.js version: {version}"
+            return (
+                False,
+                version,
+                f"Unable to parse Node.js version: {version}",
+            )
 
         if major_version >= min_version:
             return True, version, None
 
-        return False, version, f"Node.js >= {min_version} required, found {version}"
+        return (
+            False,
+            version,
+            f"Node.js >= {min_version} required, found {version}",
+        )
 
     return await _run_binary_check(
         name="nodejs",
