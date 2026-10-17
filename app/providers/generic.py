@@ -6,18 +6,18 @@ import json
 import tempfile
 from functools import lru_cache
 from pathlib import Path
-from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import structlog
 
 from app.models.video import DownloadResult, VideoFormat
-from app.providers.youtube import YouTubeProvider
 from app.providers.exceptions import (
     DownloadError,
     InvalidURLError,
     TranscriptNotFoundError,
 )
+from app.providers.youtube import YouTubeProvider
 from app.utils.transcript import parse_vtt
 
 logger = structlog.get_logger(__name__)
@@ -25,23 +25,23 @@ logger = structlog.get_logger(__name__)
 
 @lru_cache(maxsize=1)
 def _get_site_extractors():
-    """Load yt-dlp extractors, excluding the catch-all generic extractor."""
+    """Load specific yt-dlp extractors, excluding the catch-all extractor."""
     from yt_dlp.extractor import gen_extractor_classes
 
     extractors = []
 
     for extractor in gen_extractor_classes():
-        name = str(
+        extractor_name = str(
             getattr(extractor, "IE_NAME", "") or ""
         ).lower()
 
         class_name = str(
-            getattr(extractor, "__name__", "")
+            getattr(extractor, "__name__", "") or ""
         ).lower()
 
-        # Never use yt-dlp's catch-all web extractor as proof that
-        # an arbitrary URL is a recognized media page.
-        if name in {"generic", "generic:search"}:
+        # Arbitrary URLs must not qualify merely because the generic
+        # extractor can try to inspect an ordinary webpage.
+        if extractor_name in {"generic", "generic:search"}:
             continue
 
         if class_name in {"genericie", "genericauthie"}:
@@ -52,13 +52,24 @@ def _get_site_extractors():
     return tuple(extractors)
 
 
-class GenericYtDlpProvider(YouTubeProvider):
-    """
-    Provider for non-YouTube websites supported by installed yt-dlp
-    site extractors.
+def _is_youtube_host(host: str) -> bool:
+    """Identify YouTube hosts reserved for the dedicated provider."""
+    host = host.lower().rstrip(".")
 
-    Inherits the existing retry logic and common parsing helpers, but
-    does not use the YouTube cookie service for generic downloads.
+    return (
+        host == "youtube.com"
+        or host.endswith(".youtube.com")
+        or host == "youtu.be"
+        or host == "youtube-nocookie.com"
+        or host.endswith(".youtube-nocookie.com")
+    )
+
+
+class GenericYtDlpProvider(YouTubeProvider):
+    """Downloads media from recognized non-YouTube yt-dlp sites.
+
+    Reuses the existing YouTube provider's retry, parsing, and subprocess
+    infrastructure while intentionally not using YouTube cookies.
     """
 
     name = "generic_ytdlp"
@@ -85,8 +96,8 @@ class GenericYtDlpProvider(YouTubeProvider):
         )
 
     def validate_url(self, url: str) -> bool:
-        """Accept recognized public HTTP(S) media URLs, excluding YouTube."""
-        if not url or not isinstance(url, str):
+        """Accept recognized public HTTP(S) URLs, excluding YouTube."""
+        if not isinstance(url, str) or not url.strip():
             return False
 
         try:
@@ -95,6 +106,7 @@ class GenericYtDlpProvider(YouTubeProvider):
             if parsed.scheme.lower() not in {"http", "https"}:
                 return False
 
+            # Reject embedded credentials.
             if parsed.username or parsed.password:
                 return False
 
@@ -107,32 +119,31 @@ class GenericYtDlpProvider(YouTubeProvider):
             if (
                 host == "localhost"
                 or host.endswith(
-                    (".localhost", ".local", ".internal", ".test")
+                    (
+                        ".localhost",
+                        ".local",
+                        ".internal",
+                        ".test",
+                    )
                 )
             ):
                 return False
 
-            # Reject literal IP URLs, including private and loopback IPs.
+            # Reject direct IP-address URLs.
             try:
                 ipaddress.ip_address(host)
                 return False
             except ValueError:
                 pass
 
-            # Keep YouTube on its dedicated, cookie-aware provider.
-            if (
-                host == "youtube.com"
-                or host.endswith(".youtube.com")
-                or host == "youtu.be"
-                or host == "youtube-nocookie.com"
-                or host.endswith(".youtube-nocookie.com")
-            ):
+            # The dedicated provider must handle YouTube.
+            if _is_youtube_host(host):
                 return False
 
-            # Accept only a URL recognized by an installed site extractor.
+            # Require a site-specific extractor to recognize the URL.
             for extractor in _get_site_extractors():
                 try:
-                    if extractor.suitable(url):
+                    if extractor.suitable(url.strip()):
                         return True
                 except Exception:
                     continue
@@ -152,7 +163,7 @@ class GenericYtDlpProvider(YouTubeProvider):
         include_formats: bool = False,
         include_subtitles: bool = False,
     ) -> Dict[str, Any]:
-        """Retrieve metadata for a recognized non-YouTube media URL."""
+        """Extract metadata for a recognized non-YouTube URL."""
         if not self.validate_url(url):
             raise InvalidURLError(
                 "URL is not recognized by the generic yt-dlp provider."
@@ -160,6 +171,7 @@ class GenericYtDlpProvider(YouTubeProvider):
 
         command = [
             "yt-dlp",
+            "--ignore-config",
             "--no-warnings",
             "--no-playlist",
             "--skip-download",
@@ -211,15 +223,12 @@ class GenericYtDlpProvider(YouTubeProvider):
             )
 
         if include_subtitles:
-            subtitles = info.get("subtitles") or {}
-            automatic_subtitles = info.get("automatic_captions") or {}
-
             video_info["subtitles"] = self._parse_subtitles(
-                subtitles
+                info.get("subtitles") or {}
             )
 
             video_info["automatic_subtitles"] = self._parse_subtitles(
-                automatic_subtitles
+                info.get("automatic_captions") or {}
             )
 
         logger.info(
@@ -233,7 +242,7 @@ class GenericYtDlpProvider(YouTubeProvider):
         self,
         url: str,
     ) -> List[VideoFormat]:
-        """List formats exposed by the media website."""
+        """List available formats for a recognized media URL."""
         info = await self.get_info(
             url,
             include_formats=True,
@@ -272,7 +281,7 @@ class GenericYtDlpProvider(YouTubeProvider):
         lang: str = "en",
         source: str = "any",
     ) -> Dict[str, Any]:
-        """Try to retrieve a subtitle transcript when the site exposes one."""
+        """Retrieve subtitle text where the website provides subtitles."""
         if not self.validate_url(url):
             raise InvalidURLError(
                 "URL is not recognized by the generic yt-dlp provider."
@@ -301,6 +310,7 @@ class GenericYtDlpProvider(YouTubeProvider):
 
                 command = [
                     "yt-dlp",
+                    "--ignore-config",
                     "--no-warnings",
                     "--no-playlist",
                     "--skip-download",
@@ -364,7 +374,7 @@ class GenericYtDlpProvider(YouTubeProvider):
         include_subtitles: bool = False,
         subtitle_lang: Optional[str] = None,
     ) -> DownloadResult:
-        """Download media through yt-dlp and return the resulting file."""
+        """Download media and return the resulting file information."""
         if not self.validate_url(url):
             raise InvalidURLError(
                 "URL is not recognized by the generic yt-dlp provider."
@@ -375,21 +385,23 @@ class GenericYtDlpProvider(YouTubeProvider):
             or "%(title).150B [%(id)s].%(ext)s"
         )
 
-        # Keep caller-supplied output templates inside the configured
-        # output directory. yt-dlp formatting placeholders are allowed.
+        # Keep downloads inside the configured output directory.
+        # yt-dlp template substitutions such as %(title)s are permitted.
+        template_path = Path(template)
+
         if (
-            Path(template).is_absolute()
-            or ".." in Path(template).parts
+            template_path.is_absolute()
+            or ".." in template_path.parts
             or "/" in template
             or "\\" in template
         ):
             raise DownloadError(
-                "Output template must be a filename template, "
-                "not a path."
+                "Output template must be a filename template, not a path."
             )
 
         command = [
             "yt-dlp",
+            "--ignore-config",
             "--no-warnings",
             "--no-playlist",
             "--print",
@@ -404,16 +416,16 @@ class GenericYtDlpProvider(YouTubeProvider):
             command.extend(["--format", format_id])
 
         if extract_audio:
+            selected_audio_format = (
+                audio_format or "mp3"
+            ).lower()
+
             allowed_audio_formats = {
                 "mp3",
                 "m4a",
                 "wav",
                 "opus",
             }
-
-            selected_audio_format = (
-                audio_format or "mp3"
-            ).lower()
 
             if selected_audio_format not in allowed_audio_formats:
                 raise DownloadError(
@@ -427,7 +439,10 @@ class GenericYtDlpProvider(YouTubeProvider):
             ])
 
             if selected_audio_format in {"mp3", "m4a"}:
-                command.extend(["--audio-quality", "0"])
+                command.extend([
+                    "--audio-quality",
+                    "0",
+                ])
 
         if include_subtitles:
             command.append("--write-subs")
@@ -470,7 +485,7 @@ class GenericYtDlpProvider(YouTubeProvider):
 
         file_path = file_path.resolve()
 
-        # Prevent returning a path outside the managed output directory.
+        # Prevent a returned file path from escaping the output directory.
         try:
             file_path.relative_to(self.output_dir)
         except ValueError as exc:
