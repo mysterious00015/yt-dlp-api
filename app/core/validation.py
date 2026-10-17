@@ -1,14 +1,12 @@
 """Input validation utilities for the API layer.
 
-Provides validation for media URLs, yt-dlp format selectors, audio
-parameters, language codes, and numeric request parameters.
+This module provides validation functions for URLs, format IDs, and other
+parameters that are used across API endpoints.
 """
 
-import ipaddress
 import re
 from dataclasses import dataclass
 from enum import Enum
-from functools import lru_cache
 from typing import FrozenSet, Optional, Set
 from urllib.parse import urlparse
 
@@ -16,67 +14,6 @@ import structlog
 
 logger = structlog.get_logger(__name__)
 
-
-# ------------------------------------------------------------
-# YT-DLP SITE EXTRACTOR DISCOVERY
-# ------------------------------------------------------------
-
-@lru_cache(maxsize=1)
-def _get_supported_extractors():
-    """Load known yt-dlp site extractors, excluding the catch-all generic one."""
-    try:
-        from yt_dlp.extractor import gen_extractor_classes
-    except ImportError:
-        logger.error("Could not import yt-dlp extractors")
-        return ()
-
-    supported = []
-
-    for extractor in gen_extractor_classes():
-        extractor_name = str(
-            getattr(extractor, "IE_NAME", "") or ""
-        ).lower()
-
-        class_name = str(
-            getattr(extractor, "__name__", "") or ""
-        ).lower()
-
-        # Do not treat the catch-all generic extractor as support for
-        # an arbitrary URL supplied by an API caller.
-        if extractor_name in {
-            "generic",
-            "generic:search",
-        }:
-            continue
-
-        if class_name in {
-            "genericie",
-            "genericauthie",
-        }:
-            continue
-
-        supported.append(extractor)
-
-    return tuple(supported)
-
-
-def _recognized_by_ytdlp(url: str) -> bool:
-    """Return whether a specific installed yt-dlp extractor recognizes a URL."""
-    for extractor in _get_supported_extractors():
-        try:
-            if extractor.suitable(url):
-                return True
-        except Exception:
-            # One extractor failing to inspect a URL must not prevent
-            # other extractors from checking it.
-            continue
-
-    return False
-
-
-# ------------------------------------------------------------
-# AUDIO OPTIONS
-# ------------------------------------------------------------
 
 class AudioFormat(str, Enum):
     """Supported audio output formats."""
@@ -95,10 +32,6 @@ class AudioQuality(str, Enum):
     HIGH = "320"
 
 
-# ------------------------------------------------------------
-# VALIDATION RESULT
-# ------------------------------------------------------------
-
 @dataclass(frozen=True)
 class ValidationResult:
     """Result of a validation operation."""
@@ -108,21 +41,20 @@ class ValidationResult:
     sanitized_value: Optional[str] = None
 
 
-# ------------------------------------------------------------
-# URL VALIDATION
-# ------------------------------------------------------------
-
 class URLValidator:
-    """Validate public HTTP(S) URLs against configured or yt-dlp providers.
+    """Validates URLs against an allowed domain whitelist."""
 
-    When an explicit allowed_domains allowlist is passed, only those
-    domains and their subdomains are accepted.
+    # Default allowed domains for video providers
+    DEFAULT_ALLOWED_DOMAINS: FrozenSet[str] = frozenset(
+        {
+            "youtube.com",
+            "www.youtube.com",
+            "m.youtube.com",
+            "youtu.be",
+        }
+    )
 
-    When no allowlist is supplied, a URL must be recognized by a specific
-    installed yt-dlp site extractor. The catch-all generic extractor is
-    deliberately excluded.
-    """
-
+    # Dangerous URL schemes that should always be rejected
     DANGEROUS_SCHEMES: FrozenSet[str] = frozenset(
         {
             "javascript",
@@ -133,223 +65,111 @@ class URLValidator:
         }
     )
 
-    BLOCKED_HOST_SUFFIXES: FrozenSet[str] = frozenset(
-        {
-            ".localhost",
-            ".local",
-            ".internal",
-            ".test",
-        }
-    )
-
-    def __init__(
-        self,
-        allowed_domains: Optional[Set[str]] = None,
-    ):
-        """Initialize URL validation.
+    def __init__(self, allowed_domains: Optional[Set[str]] = None):
+        """
+        Initialize URL validator.
 
         Args:
-            allowed_domains:
-                Optional strict hostname allowlist. If omitted, the
-                installed yt-dlp site extractors determine supported URLs.
+            allowed_domains: Set of allowed domain names. Uses default if not provided.
         """
-        if allowed_domains is None:
-            self.allowed_domains = None
-        else:
-            self.allowed_domains = {
-                str(domain).strip().lower().rstrip(".")
-                for domain in allowed_domains
-                if str(domain).strip()
-            }
+        self.allowed_domains = allowed_domains or self.DEFAULT_ALLOWED_DOMAINS
 
-    @staticmethod
-    def _normalize_url(url: str) -> str:
-        """Add HTTPS to a URL which has no explicit scheme."""
-        value = url.strip()
+    def validate(self, url: str) -> ValidationResult:  # noqa: C901
+        """Validate a URL against the whitelist.
 
-        if "://" not in value:
-            value = "https://" + value.lstrip("/")
+        Args:
+            url: URL to validate
 
-        return value
-
-    def _validate_public_hostname(self, hostname: str) -> Optional[str]:
-        """Return an error message if a hostname is unsafe or disallowed."""
-        host = hostname.lower().rstrip(".")
-
-        if not host:
-            return "URL must include a valid hostname"
-
-        if host == "localhost" or any(
-            host.endswith(suffix)
-            for suffix in self.BLOCKED_HOST_SUFFIXES
-        ):
-            return "Local and internal hostnames are not allowed"
-
-        # Reject IP literals. This blocks direct attempts to target
-        # loopback, private, link-local, or other IP-address endpoints.
-        try:
-            ipaddress.ip_address(host)
-            return "Direct IP-address URLs are not supported"
-        except ValueError:
-            pass
-
-        if self.allowed_domains is not None:
-            allowed = any(
-                host == domain or host.endswith("." + domain)
-                for domain in self.allowed_domains
-            )
-
-            if not allowed:
-                return (
-                    f"Domain '{host}' is not in the allowed list"
-                )
-
-        return None
-
-    def validate(self, url: str) -> ValidationResult:
-        """Validate a media URL.
-
-        The default policy permits URLs recognized by installed yt-dlp
-        site extractors, subject to the URL safety checks above.
+        Returns:
+            ValidationResult with validation status and any error message
         """
         if not url or not isinstance(url, str):
             return ValidationResult(
-                is_valid=False,
-                error_message="URL is required and must be a string",
+                is_valid=False, error_message="URL is required and must be a string"
             )
 
-        original = url.strip()
-
-        if not original:
-            return ValidationResult(
-                is_valid=False,
-                error_message="URL cannot be empty",
-            )
-
-        # Reject dangerous or unsupported schemes before normalizing URLs.
-        try:
-            original_parsed = urlparse(original)
-        except ValueError as exc:
-            logger.warning(
-                "URL parsing failed",
-                error=str(exc),
-            )
-            return ValidationResult(
-                is_valid=False,
-                error_message="Invalid URL format",
-            )
-
-        original_scheme = (
-            original_parsed.scheme.lower()
-            if original_parsed.scheme
-            else ""
-        )
-
-        if original_scheme in self.DANGEROUS_SCHEMES:
-            return ValidationResult(
-                is_valid=False,
-                error_message=(
-                    f"URL scheme '{original_scheme}' is not allowed"
-                ),
-            )
-
-        # Support URLs pasted without an explicit scheme.
-        normalized_url = self._normalize_url(original)
+        url = url.strip()
+        if not url:
+            return ValidationResult(is_valid=False, error_message="URL cannot be empty")
 
         try:
-            parsed = urlparse(normalized_url)
+            parsed = urlparse(url)
+        except ValueError as e:
+            logger.warning("URL parsing failed", url=url, error=str(e))
+            return ValidationResult(is_valid=False, error_message="Invalid URL format")
 
-            scheme = parsed.scheme.lower()
-            hostname = parsed.hostname
+        # Check for dangerous schemes
+        scheme = parsed.scheme.lower() if parsed.scheme else ""
+        if scheme in self.DANGEROUS_SCHEMES:
+            logger.warning("Dangerous URL scheme detected", url=url, scheme=scheme)
+            return ValidationResult(
+                is_valid=False, error_message=f"URL scheme '{scheme}' is not allowed"
+            )
 
-            # Force validation of a malformed port number.
-            _ = parsed.port
+        # Require http or https
+        if scheme not in ("http", "https", ""):
+            return ValidationResult(
+                is_valid=False, error_message="URL must use http or https scheme"
+            )
 
-        except ValueError:
+        # Extract and validate domain
+        netloc = parsed.netloc.lower()
+        if not netloc:
+            # Handle URLs without scheme (e.g., "youtube.com/watch?v=xxx")
+            # Try to extract domain from path
+            path_parts = parsed.path.split("/")
+            if path_parts:
+                potential_domain = path_parts[0].lower()
+                if potential_domain and "." in potential_domain:
+                    netloc = potential_domain
+
+        if not netloc:
+            return ValidationResult(is_valid=False, error_message="URL must include a valid domain")
+
+        # Extract hostname using parsed.hostname to correctly handle
+        # URLs with embedded credentials or port numbers
+        # parsed.hostname automatically strips credentials and port
+        domain = parsed.hostname
+        if domain:
+            domain = domain.lower()
+        else:
+            # Fallback to netloc parsing if hostname is None (shouldn't happen with valid URLs)
+            domain = netloc.split(":")[0].split("@")[-1]
+
+        # Check if domain is in whitelist
+        if domain not in self.allowed_domains:
+            logger.debug("Domain not in whitelist", url=url, domain=domain)
             return ValidationResult(
                 is_valid=False,
-                error_message="Invalid URL format",
+                error_message=f"Domain '{domain}' is not in the allowed list",
             )
 
-        if scheme not in {"http", "https"}:
-            return ValidationResult(
-                is_valid=False,
-                error_message="URL must use http or https",
-            )
-
-        if parsed.username or parsed.password:
-            return ValidationResult(
-                is_valid=False,
-                error_message=(
-                    "URLs containing embedded credentials are not allowed"
-                ),
-            )
-
-        if not hostname:
-            return ValidationResult(
-                is_valid=False,
-                error_message="URL must include a valid hostname",
-            )
-
-        host_error = self._validate_public_hostname(hostname)
-
-        if host_error:
-            logger.debug(
-                "URL rejected by hostname validation",
-                hostname=hostname,
-                reason=host_error,
-            )
-            return ValidationResult(
-                is_valid=False,
-                error_message=host_error,
-            )
-
-        # With a strict domain allowlist, the matching hostname is enough.
-        # Otherwise require a specific site extractor to recognize the URL.
-        if self.allowed_domains is None:
-            if not _recognized_by_ytdlp(normalized_url):
-                logger.debug(
-                    "URL not recognized by an installed yt-dlp extractor",
-                    hostname=hostname,
-                )
-                return ValidationResult(
-                    is_valid=False,
-                    error_message=(
-                        "This URL is not recognized by an installed "
-                        "yt-dlp site extractor"
-                    ),
-                )
-
-        logger.debug(
-            "URL validated successfully",
-            hostname=hostname,
-        )
-
-        return ValidationResult(
-            is_valid=True,
-            sanitized_value=normalized_url,
-        )
+        logger.debug("URL validated successfully", url=url, domain=domain)
+        return ValidationResult(is_valid=True, sanitized_value=url)
 
     def is_valid(self, url: str) -> bool:
-        """Quick check for a valid URL."""
+        """
+        Quick check if URL is valid.
+
+        Args:
+            url: URL to validate
+
+        Returns:
+            True if URL is valid, False otherwise
+        """
         return self.validate(url).is_valid
 
 
-# ------------------------------------------------------------
-# FORMAT ID VALIDATION
-# ------------------------------------------------------------
-
 class FormatValidator:
-    """Validate yt-dlp format IDs and approved format selectors."""
+    """Validates yt-dlp format IDs and specifications."""
 
-    # Standard format IDs may contain these characters.
-    # Bracket-based selectors are handled through SPECIAL_SELECTORS.
-    FORMAT_ID_PATTERN = re.compile(
-        r"^[a-zA-Z0-9_+-]+$"
-    )
+    # Valid format ID pattern: alphanumeric, underscore, hyphen, plus (for merged formats)
+    FORMAT_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_+-]+$")
 
+    # Maximum length for format ID
     MAX_FORMAT_ID_LENGTH = 50
 
+    # Common special format selectors (all values in lowercase for case-insensitive comparison)
     SPECIAL_SELECTORS: FrozenSet[str] = frozenset(
         {
             "best",
@@ -359,243 +179,185 @@ class FormatValidator:
             "bestaudio",
             "worstaudio",
             "bestvideo+bestaudio",
-            "best[height<=480]",
             "best[height<=720]",
             "best[height<=1080]",
         }
     )
 
-    def validate_format_id(
-        self,
-        format_id: str,
-    ) -> ValidationResult:
-        """Validate a format ID or approved selector."""
+    def validate_format_id(self, format_id: str) -> ValidationResult:
+        """
+        Validate a format ID.
+
+        Args:
+            format_id: Format ID to validate
+
+        Returns:
+            ValidationResult with validation status
+        """
         if not format_id or not isinstance(format_id, str):
+            return ValidationResult(is_valid=False, error_message="Format ID is required")
+
+        format_id = format_id.strip()
+        if not format_id:
+            return ValidationResult(is_valid=False, error_message="Format ID cannot be empty")
+
+        if len(format_id) > self.MAX_FORMAT_ID_LENGTH:
             return ValidationResult(
                 is_valid=False,
-                error_message="Format ID is required",
+                error_message=f"Format ID exceeds maximum length of {self.MAX_FORMAT_ID_LENGTH}",
             )
 
-        value = format_id.strip()
+        # Allow special selectors (case-insensitive comparison)
+        if format_id.lower() in self.SPECIAL_SELECTORS:
+            return ValidationResult(is_valid=True, sanitized_value=format_id)
 
-        if not value:
-            return ValidationResult(
-                is_valid=False,
-                error_message="Format ID cannot be empty",
-            )
-
-        if len(value) > self.MAX_FORMAT_ID_LENGTH:
-            return ValidationResult(
-                is_valid=False,
-                error_message=(
-                    f"Format ID exceeds maximum length of "
-                    f"{self.MAX_FORMAT_ID_LENGTH}"
-                ),
-            )
-
-        # Permit only explicitly approved bracket-based selectors.
-        if value.lower() in self.SPECIAL_SELECTORS:
-            return ValidationResult(
-                is_valid=True,
-                sanitized_value=value,
-            )
-
-        if not self.FORMAT_ID_PATTERN.fullmatch(value):
+        # Check pattern for standard format IDs
+        if not self.FORMAT_ID_PATTERN.match(format_id):
             return ValidationResult(
                 is_valid=False,
                 error_message="Format ID contains invalid characters",
             )
 
-        return ValidationResult(
-            is_valid=True,
-            sanitized_value=value,
-        )
+        return ValidationResult(is_valid=True, sanitized_value=format_id)
 
     def is_valid_format_id(self, format_id: str) -> bool:
-        """Quick check for a valid format ID."""
+        """Quick check if format ID is valid."""
         return self.validate_format_id(format_id).is_valid
 
 
-# ------------------------------------------------------------
-# OTHER REQUEST PARAMETER VALIDATION
-# ------------------------------------------------------------
-
 class ParameterValidator:
-    """Validate audio, language, and numeric request parameters."""
+    """Validates API request parameters."""
 
-    def validate_audio_format(
-        self,
-        audio_format: str,
-    ) -> ValidationResult:
-        """Validate the requested audio format."""
+    def validate_audio_format(self, audio_format: str) -> ValidationResult:
+        """
+        Validate audio format parameter.
+
+        Args:
+            audio_format: Audio format string
+
+        Returns:
+            ValidationResult with validation status
+        """
         if not audio_format:
-            return ValidationResult(
-                is_valid=False,
-                error_message="Audio format is required",
-            )
-
-        value = audio_format.lower().strip()
+            return ValidationResult(is_valid=False, error_message="Audio format is required")
 
         try:
-            AudioFormat(value)
-
-            return ValidationResult(
-                is_valid=True,
-                sanitized_value=value,
-            )
-
+            AudioFormat(audio_format.lower())
+            return ValidationResult(is_valid=True, sanitized_value=audio_format.lower())
         except ValueError:
-            valid_formats = [
-                item.value for item in AudioFormat
-            ]
-
+            valid_formats = [f.value for f in AudioFormat]
             return ValidationResult(
                 is_valid=False,
-                error_message=(
-                    "Invalid audio format. Valid options: "
-                    f"{', '.join(valid_formats)}"
-                ),
+                error_message=f"Invalid audio format. Valid options: {', '.join(valid_formats)}",
             )
 
-    def validate_audio_quality(
-        self,
-        quality: str,
-    ) -> ValidationResult:
-        """Validate the requested audio bitrate."""
+    def validate_audio_quality(self, quality: str) -> ValidationResult:
+        """
+        Validate audio quality parameter.
+
+        Args:
+            quality: Audio quality string (bitrate)
+
+        Returns:
+            ValidationResult with validation status
+        """
         if not quality:
-            return ValidationResult(
-                is_valid=False,
-                error_message="Audio quality is required",
-            )
-
-        value = str(quality).strip()
+            return ValidationResult(is_valid=False, error_message="Audio quality is required")
 
         try:
-            AudioQuality(value)
-
-            return ValidationResult(
-                is_valid=True,
-                sanitized_value=value,
-            )
-
+            AudioQuality(quality)
+            return ValidationResult(is_valid=True, sanitized_value=quality)
         except ValueError:
-            valid_qualities = [
-                item.value for item in AudioQuality
-            ]
-
+            valid_qualities = [f.value for f in AudioQuality]
             return ValidationResult(
                 is_valid=False,
-                error_message=(
-                    "Invalid audio quality. Valid options: "
-                    f"{', '.join(valid_qualities)}kbps"
-                ),
+                error_message=f"Invalid audio quality. Valid options: {', '.join(valid_qualities)}kbps",
             )
 
-    def validate_language_code(
-        self,
-        lang_code: str,
-    ) -> ValidationResult:
-        """Validate an ISO-style language code."""
+    def validate_language_code(self, lang_code: str) -> ValidationResult:
+        """
+        Validate language code for subtitles.
+
+        Args:
+            lang_code: ISO 639-1 or 639-2 language code
+
+        Returns:
+            ValidationResult with validation status
+        """
         if not lang_code or not isinstance(lang_code, str):
+            return ValidationResult(is_valid=False, error_message="Language code is required")
+
+        lang_code = lang_code.strip().lower()
+
+        # ISO 639-1 (2 chars) or ISO 639-2 (3 chars), optionally with region (e.g., en-US)
+        pattern = re.compile(r"^[a-z]{2,3}(-[a-zA-Z]{2,4})?$")
+
+        if not pattern.match(lang_code):
             return ValidationResult(
                 is_valid=False,
-                error_message="Language code is required",
+                error_message="Invalid language code format. Use ISO 639 format (e.g., 'en', 'en-US')",
             )
 
-        value = lang_code.strip()
-
-        pattern = re.compile(
-            r"^[a-zA-Z]{2,3}(?:-[a-zA-Z]{2,4})?$"
-        )
-
-        if not pattern.fullmatch(value):
-            return ValidationResult(
-                is_valid=False,
-                error_message=(
-                    "Invalid language code format. "
-                    "Use an ISO-style code such as 'en' or 'en-US'"
-                ),
-            )
-
-        return ValidationResult(
-            is_valid=True,
-            sanitized_value=value,
-        )
+        return ValidationResult(is_valid=True, sanitized_value=lang_code)
 
     def validate_positive_integer(
-        self,
-        value: int,
-        name: str,
-        max_value: Optional[int] = None,
+        self, value: int, name: str, max_value: Optional[int] = None
     ) -> ValidationResult:
-        """Validate a positive integer with an optional upper bound."""
+        """
+        Validate a positive integer parameter.
+
+        Args:
+            value: Integer value to validate
+            name: Parameter name for error messages
+            max_value: Optional maximum allowed value
+
+        Returns:
+            ValidationResult with validation status
+        """
         if not isinstance(value, int) or isinstance(value, bool):
-            return ValidationResult(
-                is_valid=False,
-                error_message=f"{name} must be an integer",
-            )
+            return ValidationResult(is_valid=False, error_message=f"{name} must be an integer")
 
         if value <= 0:
             return ValidationResult(
-                is_valid=False,
-                error_message=f"{name} must be a positive integer",
+                is_valid=False, error_message=f"{name} must be a positive integer"
             )
 
         if max_value is not None and value > max_value:
             return ValidationResult(
                 is_valid=False,
-                error_message=(
-                    f"{name} exceeds maximum allowed value of "
-                    f"{max_value}"
-                ),
+                error_message=f"{name} exceeds maximum allowed value of {max_value}",
             )
 
-        return ValidationResult(
-            is_valid=True,
-            sanitized_value=str(value),
-        )
+        return ValidationResult(is_valid=True, sanitized_value=str(value))
 
 
-# ------------------------------------------------------------
-# SHARED VALIDATOR INSTANCES
-# ------------------------------------------------------------
-
+# Singleton instances for convenience
 url_validator = URLValidator()
 format_validator = FormatValidator()
 parameter_validator = ParameterValidator()
 
 
-# ------------------------------------------------------------
-# CONVENIENCE FUNCTIONS
-# ------------------------------------------------------------
-
 def validate_youtube_url(url: str) -> bool:
-    """Return whether a URL is a recognized YouTube URL."""
-    if not url or not isinstance(url, str):
-        return False
+    """
+    Convenience function to validate YouTube URLs.
 
-    normalized = URLValidator._normalize_url(url)
+    Args:
+        url: URL to validate
 
-    try:
-        parsed = urlparse(normalized)
-        hostname = (parsed.hostname or "").lower().rstrip(".")
-    except ValueError:
-        return False
-
-    is_youtube = (
-        hostname == "youtube.com"
-        or hostname.endswith(".youtube.com")
-        or hostname == "youtu.be"
-        or hostname == "youtube-nocookie.com"
-        or hostname.endswith(".youtube-nocookie.com")
-    )
-
-    if not is_youtube:
-        return False
-
-    return url_validator.is_valid(normalized)
+    Returns:
+        True if URL is a valid YouTube URL
+    """
+    return url_validator.is_valid(url)
 
 
 def validate_format_id(format_id: str) -> bool:
-    """Return whether a format ID is valid."""
+    """
+    Convenience function to validate format IDs.
+
+    Args:
+        format_id: Format ID to validate
+
+    Returns:
+        True if format ID is valid
+    """
     return format_validator.is_valid_format_id(format_id)
