@@ -7,7 +7,7 @@ before accepting requests.
 
 Implements requirements:
 - Req 10: JavaScript Challenge Resolution (Node.js >= 22)
-- Req 21: Node.js Runtime Configuration (--js-runtimes flag)
+- Req 21: JavaScript Runtime Configuration for yt-dlp
 - Req 22: Output Directory Management
 - Req 23: Cookie Directory Management
 - Req 47: Graceful Startup Mode (degraded mode support)
@@ -29,16 +29,14 @@ logger = structlog.get_logger(__name__)
 
 def _is_test_mode() -> bool:
     """Check if test mode is enabled via environment variable."""
-    return os.environ.get("APP_TESTING_TEST_MODE", "").lower() in (
-        "true",
-        "1",
-        "yes",
-    )
+    return os.environ.get(
+        "APP_TESTING_TEST_MODE", ""
+    ).lower() in ("true", "1", "yes")
 
 
 @dataclass
 class ComponentCheckResult:
-    """Result of a component availability check.
+    """Result of a startup component check.
 
     Attributes:
         name: Component name (e.g., "ytdlp", "ffmpeg", "nodejs")
@@ -85,25 +83,27 @@ class StartupValidator:
     - External binaries: yt-dlp, ffmpeg, Node.js >= 22
     - Storage: output directory creation and write permissions
     - Cookies: file existence and format validation
-    - yt-dlp configuration: Node.js runtime setup
+    - yt-dlp JavaScript runtime configuration
+
+    Deno is preferred when installed. Node.js is the fallback runtime.
 
     Supports degraded mode where the application can start with
     warnings when optional components are unavailable.
     """
 
-    # Minimum Node.js version required for JavaScript challenge resolution
+    # Minimum Node.js version required by this deployment.
     MIN_NODEJS_VERSION = 22
 
-    # Components that must be available even in degraded mode
-    # In test mode, ytdlp is not critical as we use mock executor
+    # Components that must be available even in degraded mode.
+    # In test mode, yt-dlp is mocked.
     ALWAYS_CRITICAL_COMPONENTS = {"ytdlp", "storage"}
 
     @property
     def critical_components(self) -> set:
-        """Get set of critical components based on mode."""
+        """Get the set of critical components based on mode."""
         if _is_test_mode():
-            # In test mode, only storage is critical (we mock yt-dlp)
             return {"storage"}
+
         return self.ALWAYS_CRITICAL_COMPONENTS
 
     def __init__(self, config: Config):
@@ -130,39 +130,34 @@ class StartupValidator:
             allow_degraded_start=self.allow_degraded,
         )
 
-        # Reset state for fresh validation
+        # Reset state for fresh validation.
         self.results = []
         self.disabled_providers = []
         self.errors = []
         self.warnings = []
 
-        # Run all checks
+        # Run all component checks.
         await self._run_checks()
 
-        # Determine overall status
         critical_failures = [
             result
             for result in self.results
             if not result.passed and result.critical
         ]
+
         non_critical_failures = [
             result
             for result in self.results
             if not result.passed and not result.critical
         ]
 
-        # Configure yt-dlp runtime if Node.js is available.
-        nodejs_check = next(
-            (result for result in self.results if result.name == "nodejs"),
-            None,
-        )
-        if nodejs_check and nodejs_check.passed:
-            self.configure_ytdlp_runtime()
+        # Configure the available JavaScript runtime.
+        # Prefer Deno; fall back to Node.js.
+        self.configure_ytdlp_runtime()
 
-        # Determine if we can start
+        # Determine whether the application can start.
         if critical_failures:
             if self.allow_degraded:
-                # In degraded mode, only truly critical failures block startup.
                 truly_critical = [
                     result
                     for result in critical_failures
@@ -174,14 +169,15 @@ class StartupValidator:
                         self.errors.append(
                             f"{result.name}: {result.message}"
                         )
+
                     success = False
                     degraded_mode = False
                 else:
-                    # Other critical failures become warnings in degraded mode.
                     for result in critical_failures:
                         self.warnings.append(
                             f"{result.name}: {result.message}"
                         )
+
                     success = True
                     degraded_mode = True
             else:
@@ -189,12 +185,13 @@ class StartupValidator:
                     self.errors.append(
                         f"{result.name}: {result.message}"
                     )
+
                 success = False
                 degraded_mode = False
         else:
             success = True
             degraded_mode = (
-                len(non_critical_failures) > 0
+                bool(non_critical_failures)
                 and self.allow_degraded
             )
 
@@ -214,6 +211,7 @@ class StartupValidator:
         )
 
         log_method = logger.info if success else logger.error
+
         log_method(
             "startup_validation_completed",
             success=success,
@@ -227,7 +225,6 @@ class StartupValidator:
 
     async def _run_checks(self) -> None:
         """Run all component checks."""
-        # Check external binaries.
         ytdlp_result = await self.check_ytdlp()
         self.results.append(ytdlp_result)
 
@@ -237,22 +234,14 @@ class StartupValidator:
         nodejs_result = await self.check_nodejs()
         self.results.append(nodejs_result)
 
-        # Check storage.
         storage_result = await self.check_storage()
         self.results.append(storage_result)
 
-        # Check cookies.
         cookie_result = await self.check_cookies()
         self.results.append(cookie_result)
 
     async def check_ytdlp(self) -> ComponentCheckResult:
-        """Check yt-dlp availability and version.
-
-        This is a critical check. Startup fails if yt-dlp is unavailable.
-
-        Returns:
-            ComponentCheckResult with yt-dlp status.
-        """
+        """Check yt-dlp availability and version."""
         result = await check_ytdlp()
 
         if result.available:
@@ -260,6 +249,7 @@ class StartupValidator:
                 "ytdlp_check_passed",
                 version=result.version,
             )
+
             return ComponentCheckResult(
                 name="ytdlp",
                 passed=True,
@@ -272,6 +262,7 @@ class StartupValidator:
             "ytdlp_check_failed",
             error=result.error,
         )
+
         return ComponentCheckResult(
             name="ytdlp",
             passed=False,
@@ -280,13 +271,7 @@ class StartupValidator:
         )
 
     async def check_ffmpeg(self) -> ComponentCheckResult:
-        """Check ffmpeg availability and version.
-
-        This is a critical check. Startup fails if ffmpeg is unavailable.
-
-        Returns:
-            ComponentCheckResult with ffmpeg status.
-        """
+        """Check FFmpeg availability and version."""
         result = await check_ffmpeg()
 
         if result.available:
@@ -294,34 +279,29 @@ class StartupValidator:
                 "ffmpeg_check_passed",
                 version=result.version,
             )
+
             return ComponentCheckResult(
                 name="ffmpeg",
                 passed=True,
                 critical=True,
                 version=result.version,
-                message="ffmpeg is available",
+                message="FFmpeg is available",
             )
 
         logger.error(
             "ffmpeg_check_failed",
             error=result.error,
         )
+
         return ComponentCheckResult(
             name="ffmpeg",
             passed=False,
             critical=True,
-            message=result.error or "ffmpeg is not available",
+            message=result.error or "FFmpeg is not available",
         )
 
     async def check_nodejs(self) -> ComponentCheckResult:
-        """Check Node.js availability and version >= 22.
-
-        Node.js 22 or newer is required for the current yt-dlp EJS
-        JavaScript challenge runtime.
-
-        Returns:
-            ComponentCheckResult with Node.js status.
-        """
+        """Check Node.js availability and version >= 22."""
         result = await check_nodejs(
             min_version=self.MIN_NODEJS_VERSION
         )
@@ -331,6 +311,7 @@ class StartupValidator:
                 "nodejs_check_passed",
                 version=result.version,
             )
+
             return ComponentCheckResult(
                 name="nodejs",
                 passed=True,
@@ -343,6 +324,7 @@ class StartupValidator:
             "nodejs_check_failed",
             error=result.error,
         )
+
         return ComponentCheckResult(
             name="nodejs",
             passed=False,
@@ -354,18 +336,16 @@ class StartupValidator:
         )
 
     async def check_storage(self) -> ComponentCheckResult:
-        """Check storage directory availability and permissions.
-
-        Creates the output directory if it does not exist.
-
-        Returns:
-            ComponentCheckResult with storage status.
-        """
+        """Check storage directory availability and permissions."""
         output_dir = Path(self.config.storage.output_dir)
 
         try:
             if not output_dir.exists():
-                output_dir.mkdir(parents=True, exist_ok=True)
+                output_dir.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+
                 logger.info(
                     "output_directory_created",
                     path=str(output_dir),
@@ -381,6 +361,7 @@ class StartupValidator:
                     "storage_permission_error",
                     path=str(output_dir),
                 )
+
                 return ComponentCheckResult(
                     name="storage",
                     passed=False,
@@ -394,6 +375,7 @@ class StartupValidator:
                 "storage_check_passed",
                 path=str(output_dir),
             )
+
             return ComponentCheckResult(
                 name="storage",
                 passed=True,
@@ -408,6 +390,7 @@ class StartupValidator:
                 path=str(output_dir),
                 error=str(error),
             )
+
             return ComponentCheckResult(
                 name="storage",
                 passed=False,
@@ -422,7 +405,6 @@ class StartupValidator:
     ) -> ComponentCheckResult:
         """Create a cookie check failure result."""
         if self.allow_degraded:
-            # In test mode, don't disable providers; mocks are used instead.
             if not _is_test_mode():
                 self.disabled_providers.append(provider)
 
@@ -447,7 +429,7 @@ class StartupValidator:
     ) -> Optional[ComponentCheckResult]:
         """Verify that the cookie file exists and is accessible."""
         try:
-            if path.exists():
+            if path.is_file():
                 return None
         except OSError as error:
             logger.error(
@@ -455,6 +437,7 @@ class StartupValidator:
                 path=cookie_path,
                 error=str(error),
             )
+
             return self._cookie_failure(
                 f"Cannot access cookie file: {cookie_path} ({error})"
             )
@@ -463,17 +446,16 @@ class StartupValidator:
             "youtube_cookie_not_found",
             path=cookie_path,
         )
+
         return self._cookie_failure(
             f"Cookie file not found: {cookie_path}"
         )
 
     async def check_cookies(self) -> ComponentCheckResult:
-        """Check cookie file availability and Netscape format.
-
-        Missing cookies are non-critical in degraded mode.
-        """
+        """Check cookie file availability and Netscape format."""
         if not self.config.providers.youtube.enabled:
             logger.info("youtube_provider_disabled")
+
             return ComponentCheckResult(
                 name="cookies",
                 passed=True,
@@ -484,8 +466,10 @@ class StartupValidator:
             )
 
         cookie_path = self.config.providers.youtube.cookie_path
+
         if not cookie_path:
             logger.warning("youtube_cookie_not_configured")
+
             return self._cookie_failure(
                 "No cookie path configured for YouTube"
             )
@@ -496,6 +480,7 @@ class StartupValidator:
             path,
             cookie_path,
         )
+
         if access_failure is not None:
             return access_failure
 
@@ -507,15 +492,17 @@ class StartupValidator:
                     "youtube_cookie_empty",
                     path=cookie_path,
                 )
+
                 return self._cookie_failure(
                     "Cookie file is empty"
                 )
 
             lines = [
                 line
-                for line in content.strip().split("\n")
+                for line in content.strip().splitlines()
                 if line.strip() and not line.startswith("#")
             ]
+
             valid_entries = sum(
                 1
                 for line in lines
@@ -527,6 +514,7 @@ class StartupValidator:
                     "youtube_cookie_invalid_format",
                     path=cookie_path,
                 )
+
                 return self._cookie_failure(
                     "Cookie file has invalid format "
                     "(no valid Netscape entries)"
@@ -537,6 +525,7 @@ class StartupValidator:
                 path=cookie_path,
                 valid_entries=valid_entries,
             )
+
             return ComponentCheckResult(
                 name="cookies",
                 passed=True,
@@ -553,32 +542,49 @@ class StartupValidator:
                 "youtube_cookie_permission_error",
                 path=cookie_path,
             )
+
             return self._cookie_failure(
                 f"Cannot read cookie file: {cookie_path}"
             )
+
         except Exception as error:
             logger.error(
                 "youtube_cookie_read_error",
                 path=cookie_path,
                 error=str(error),
             )
+
             return self._cookie_failure(
                 f"Error reading cookie file: {error}"
             )
 
     def configure_ytdlp_runtime(self) -> None:
-        """Configure yt-dlp to use the installed Node.js runtime.
+        """Configure yt-dlp to prefer Deno, falling back to Node.js.
 
-        Writing the absolute executable path ensures yt-dlp knows exactly
-        which Node.js binary to use for JavaScript challenge resolution.
+        Uses an absolute path so yt-dlp can locate the selected runtime.
+        This method only configures the runtime; it cannot guarantee that
+        YouTube will accept the request or that a challenge will succeed.
         """
+        deno_path = shutil.which("deno")
         node_path = shutil.which("node")
 
-        if not node_path:
-            logger.warning("ytdlp_node_runtime_not_found")
+        if deno_path:
+            runtime_setting = f"deno:{deno_path}"
+            runtime_name = "deno"
+            runtime_path = deno_path
+        elif node_path:
+            runtime_setting = f"node:{node_path}"
+            runtime_name = "node"
+            runtime_path = node_path
+        else:
+            logger.warning(
+                "ytdlp_js_runtime_not_found",
+                message="Neither Deno nor Node.js was found",
+            )
             return
 
         xdg_config = os.environ.get("XDG_CONFIG_HOME", "")
+
         if xdg_config:
             config_dir = Path(xdg_config) / "yt-dlp"
         else:
@@ -598,18 +604,20 @@ class StartupValidator:
                 else []
             )
 
-            # Preserve unrelated settings and replace old JS runtime lines.
+            # Preserve other yt-dlp options, replacing previous
+            # JavaScript-runtime selection options.
             preserved_lines = [
                 line
                 for line in existing_lines
                 if not line.strip().startswith("--js-runtimes")
+                and not line.strip().startswith("--no-js-runtimes")
             ]
 
             preserved_lines.append(
-                "# Added by yt-dlp-api for JavaScript challenge resolution"
+                "# JavaScript runtime configured by yt-dlp-api"
             )
             preserved_lines.append(
-                f"--js-runtimes node:{node_path}"
+                f"--js-runtimes {runtime_setting}"
             )
 
             config_file.write_text(
@@ -618,15 +626,16 @@ class StartupValidator:
 
             logger.info(
                 "ytdlp_runtime_configured",
+                runtime=runtime_name,
+                runtime_path=runtime_path,
                 config_file=str(config_file),
-                runtime=node_path,
             )
 
         except Exception as error:
-            # A failed config write should be visible in logs for diagnosis.
             logger.warning(
                 "ytdlp_config_write_failed",
                 config_file=str(config_file),
-                runtime=node_path,
+                runtime=runtime_name,
+                runtime_path=runtime_path,
                 error=str(error),
             )
