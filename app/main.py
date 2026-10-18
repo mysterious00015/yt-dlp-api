@@ -219,8 +219,8 @@ class InstagramYtDlpProvider(YouTubeProvider):
             "after_move:filepath",
         ]
 
-                # Handle landscape and portrait Instagram videos.
-        # For portrait Reels, width is often the useful quality limit.
+                        # Instagram format selection: support portrait and landscape Reels.
+        # Use the shorter video dimension when prioritizing resolution.
         if format_id:
             quality_match = re.fullmatch(
                 r"best\[height<=([0-9]+)\]",
@@ -230,14 +230,15 @@ class InstagramYtDlpProvider(YouTubeProvider):
             if quality_match:
                 quality_cap = quality_match.group(1)
 
-                instagram_format_selector = (
-                    f"best[height<={quality_cap}]"
-                    f"/best[width<={quality_cap}]"
-                )
+                # Prefer formats at or below the requested resolution.
+                # If none are available, select the best available format
+                # instead of failing with "Requested format is not available".
+                cmd.extend([
+                    "-f", "best",
+                    "-S", f"res:{quality_cap}",
+                ])
             else:
-                instagram_format_selector = format_id
-
-            cmd.extend(["-f", instagram_format_selector])
+                cmd.extend(["-f", format_id])
 
         if extract_audio:
             cmd.extend([
