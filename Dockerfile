@@ -134,4 +134,4 @@ EXPOSE 8000 10000
 # =============================================================================
 # Start API
 # =============================================================================
-CMD ["sh", "-c", "exec python -m uvicorn app.main:app --host \"$APP_SERVER_HOST\" --port \"$APP_SERVER_PORT\""]
+CMD ["sh", "-c", "if [ -n \"${YOUTUBE_COOKIES_B64:-}\" ]; then printf '%s' \"$YOUTUBE_COOKIES_B64\" | base64 -d > /app/cookies/youtube.txt || exit 1; chmod 600 /app/cookies/youtube.txt; fi; exec python -m uvicorn app.main:app --host \"$APP_SERVER_HOST\" --port \"$APP_SERVER_PORT\""]
