@@ -124,7 +124,10 @@ class URLValidator:
                     netloc = potential_domain
 
         if not netloc:
-            return ValidationResult(is_valid=False, error_message="URL must include a valid domain")
+            return ValidationResult(
+                is_valid=False,
+                error_message="URL must include a valid domain",
+            )
 
         # Extract hostname using parsed.hostname to correctly handle
         # URLs with embedded credentials or port numbers
@@ -133,7 +136,7 @@ class URLValidator:
         if domain:
             domain = domain.lower()
         else:
-            # Fallback to netloc parsing if hostname is None (shouldn't happen with valid URLs)
+            # Fallback to netloc parsing if hostname is None
             domain = netloc.split(":")[0].split("@")[-1]
 
         # Check if domain is in whitelist
@@ -163,13 +166,16 @@ class URLValidator:
 class FormatValidator:
     """Validates yt-dlp format IDs and specifications."""
 
-    # Valid format ID pattern: alphanumeric, underscore, hyphen, plus (for merged formats)
+    # Valid format ID pattern: alphanumeric, underscore, hyphen, plus
+    # (for merged formats)
     FORMAT_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_+-]+$")
 
     # Maximum length for format ID
     MAX_FORMAT_ID_LENGTH = 50
 
-    # Common special format selectors (all values in lowercase for case-insensitive comparison)
+    # Common special selectors accepted by the API.
+    # The short bv/ba selectors prefer separate video and audio streams,
+    # while retaining a fallback to a combined stream at the same height cap.
     SPECIAL_SELECTORS: FrozenSet[str] = frozenset(
         {
             "best",
@@ -179,8 +185,12 @@ class FormatValidator:
             "bestaudio",
             "worstaudio",
             "bestvideo+bestaudio",
+            "best[height<=480]",
             "best[height<=720]",
             "best[height<=1080]",
+            "bv[height<=480]+ba/b[height<=480]",
+            "bv[height<=720]+ba/b[height<=720]",
+            "bv[height<=1080]+ba/b[height<=1080]",
         }
     )
 
@@ -195,16 +205,23 @@ class FormatValidator:
             ValidationResult with validation status
         """
         if not format_id or not isinstance(format_id, str):
-            return ValidationResult(is_valid=False, error_message="Format ID is required")
+            return ValidationResult(
+                is_valid=False, error_message="Format ID is required"
+            )
 
         format_id = format_id.strip()
         if not format_id:
-            return ValidationResult(is_valid=False, error_message="Format ID cannot be empty")
+            return ValidationResult(
+                is_valid=False, error_message="Format ID cannot be empty"
+            )
 
         if len(format_id) > self.MAX_FORMAT_ID_LENGTH:
             return ValidationResult(
                 is_valid=False,
-                error_message=f"Format ID exceeds maximum length of {self.MAX_FORMAT_ID_LENGTH}",
+                error_message=(
+                    f"Format ID exceeds maximum length of "
+                    f"{self.MAX_FORMAT_ID_LENGTH}"
+                ),
             )
 
         # Allow special selectors (case-insensitive comparison)
@@ -239,16 +256,23 @@ class ParameterValidator:
             ValidationResult with validation status
         """
         if not audio_format:
-            return ValidationResult(is_valid=False, error_message="Audio format is required")
+            return ValidationResult(
+                is_valid=False, error_message="Audio format is required"
+            )
 
         try:
             AudioFormat(audio_format.lower())
-            return ValidationResult(is_valid=True, sanitized_value=audio_format.lower())
+            return ValidationResult(
+                is_valid=True, sanitized_value=audio_format.lower()
+            )
         except ValueError:
             valid_formats = [f.value for f in AudioFormat]
             return ValidationResult(
                 is_valid=False,
-                error_message=f"Invalid audio format. Valid options: {', '.join(valid_formats)}",
+                error_message=(
+                    f"Invalid audio format. Valid options: "
+                    f"{', '.join(valid_formats)}"
+                ),
             )
 
     def validate_audio_quality(self, quality: str) -> ValidationResult:
@@ -262,16 +286,23 @@ class ParameterValidator:
             ValidationResult with validation status
         """
         if not quality:
-            return ValidationResult(is_valid=False, error_message="Audio quality is required")
+            return ValidationResult(
+                is_valid=False, error_message="Audio quality is required"
+            )
 
         try:
             AudioQuality(quality)
-            return ValidationResult(is_valid=True, sanitized_value=quality)
+            return ValidationResult(
+                is_valid=True, sanitized_value=quality
+            )
         except ValueError:
             valid_qualities = [f.value for f in AudioQuality]
             return ValidationResult(
                 is_valid=False,
-                error_message=f"Invalid audio quality. Valid options: {', '.join(valid_qualities)}kbps",
+                error_message=(
+                    f"Invalid audio quality. Valid options: "
+                    f"{', '.join(valid_qualities)}kbps"
+                ),
             )
 
     def validate_language_code(self, lang_code: str) -> ValidationResult:
@@ -285,17 +316,23 @@ class ParameterValidator:
             ValidationResult with validation status
         """
         if not lang_code or not isinstance(lang_code, str):
-            return ValidationResult(is_valid=False, error_message="Language code is required")
+            return ValidationResult(
+                is_valid=False, error_message="Language code is required"
+            )
 
         lang_code = lang_code.strip().lower()
 
-        # ISO 639-1 (2 chars) or ISO 639-2 (3 chars), optionally with region (e.g., en-US)
+        # ISO 639-1 (2 chars) or ISO 639-2 (3 chars), optionally with region
+        # (e.g., en-US)
         pattern = re.compile(r"^[a-z]{2,3}(-[a-zA-Z]{2,4})?$")
 
         if not pattern.match(lang_code):
             return ValidationResult(
                 is_valid=False,
-                error_message="Invalid language code format. Use ISO 639 format (e.g., 'en', 'en-US')",
+                error_message=(
+                    "Invalid language code format. Use ISO 639 format "
+                    "(e.g., 'en', 'en-US')"
+                ),
             )
 
         return ValidationResult(is_valid=True, sanitized_value=lang_code)
@@ -315,17 +352,22 @@ class ParameterValidator:
             ValidationResult with validation status
         """
         if not isinstance(value, int) or isinstance(value, bool):
-            return ValidationResult(is_valid=False, error_message=f"{name} must be an integer")
+            return ValidationResult(
+                is_valid=False, error_message=f"{name} must be an integer"
+            )
 
         if value <= 0:
             return ValidationResult(
-                is_valid=False, error_message=f"{name} must be a positive integer"
+                is_valid=False,
+                error_message=f"{name} must be a positive integer",
             )
 
         if max_value is not None and value > max_value:
             return ValidationResult(
                 is_valid=False,
-                error_message=f"{name} exceeds maximum allowed value of {max_value}",
+                error_message=(
+                    f"{name} exceeds maximum allowed value of {max_value}"
+                ),
             )
 
         return ValidationResult(is_valid=True, sanitized_value=str(value))
