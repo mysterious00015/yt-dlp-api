@@ -508,13 +508,34 @@ class YouTubeProvider(VideoProvider):
             audio_format=audio_format,
         )
 
-        # Build yt-dlp command
+              # Build optimized yt-dlp command
         cmd = [
             "yt-dlp",
             "--cookies",
             self.cookie_path,
+
+            # Download multiple HLS/DASH fragments in parallel
+            "--concurrent-fragments",
+            "8",
+
+            # Download a single video instead of its entire playlist
+            "--no-playlist",
+
+            # Avoid waiting too long on stalled network connections
+            "--socket-timeout",
+            "20",
+
+            # Retry failed network requests and fragments
+            "--retries",
+            "5",
+            "--fragment-retries",
+            "5",
+            "--file-access-retries",
+            "3",
+
+            # Print the final downloaded file path
             "--print",
-            "after_move:filepath",  # Print final file path
+            "after_move:filepath",
         ]
 
         # Format selection
@@ -539,18 +560,17 @@ class YouTubeProvider(VideoProvider):
 
         cmd.append(url)
 
-        # Log command with redaction (Req 17A)
+        # Log command with redaction
         logger.debug("Executing yt-dlp", command=self._redact_command(cmd))
 
         start_time = asyncio.get_event_loop().time()
 
-        # Execute command with retry logic (no timeout for downloads)
-        # _execute_with_retry handles FileNotFoundError and raises DownloadError
+        # Execute command with existing retry logic
         result = await self._execute_with_retry(cmd)
         stdout = result.stdout
         stderr = result.stderr
 
-        # Log execution results (Req 17A)
+        # Log execution results
         logger.debug(
             "yt-dlp execution completed",
             command=self._redact_command(cmd),
@@ -558,7 +578,6 @@ class YouTubeProvider(VideoProvider):
             stdout_lines=len(stdout.decode().split("\n")) if stdout else 0,
             stderr_preview=stderr.decode()[:500] if stderr else None,
         )
-
         # Extract file path from output
         file_path = self._extract_file_path(stdout.decode())
         if not file_path:
