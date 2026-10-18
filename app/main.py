@@ -627,3 +627,126 @@ installed yt-dlp extractor can access the content.
 ## Authentication
 
 All endpoints except health checks require an API key in the `X-API-Key` header.
+
+## Rate Limiting
+
+- **Metadata operations** (info, formats): 100 requests/minute
+- **Download operations**: 10 requests/minute
+
+Rate limited responses include a `Retry-After` header.
+
+## Error Codes
+
+| Code | HTTP Status | Description |
+|------|-------------|-------------|
+| `INVALID_URL` | 400 | URL is malformed or not from a supported domain |
+| `INVALID_FORMAT` | 400 | Format ID is invalid |
+| `INVALID_TEMPLATE` | 400 | Format template is invalid or contains path traversal |
+| `FORMAT_NOT_FOUND` | 400 | Requested format is not available |
+| `AUTH_FAILED` | 401 | API key is missing or invalid |
+| `JOB_NOT_FOUND` | 404 | Job ID does not exist or has expired |
+| `TRANSCRIPT_NOT_FOUND` | 404 | No transcript is available for the requested language |
+| `VIDEO_UNAVAILABLE` | 404 | Video is private, deleted, or geo-blocked |
+| `RATE_LIMIT_EXCEEDED` | 429 | Rate limit reached; check `Retry-After` |
+| `WEBHOOK_NOT_ALLOWED` | 400 | Webhooks are disabled or host is not in the allow-list |
+| `DOWNLOAD_FAILED` | 500 | Download operation failed |
+| `PROVIDER_ERROR` | 500 | Provider operation failed |
+| `QUEUE_FULL` | 503 | Queue is at capacity |
+| `STORAGE_FULL` | 503 | Insufficient storage space |
+
+## Async vs Sync Downloads
+
+- **Async mode** (default): Returns HTTP 202 with `job_id` immediately.
+  Poll `GET /api/v1/jobs/{job_id}` to track progress.
+- **Sync mode**: Waits for download completion and returns HTTP 200 with the result.
+"""
+
+
+# ============================================================
+# FASTAPI APPLICATION CREATION
+# ============================================================
+
+def create_app() -> FastAPI:
+    """Create and configure the FastAPI application."""
+    app = FastAPI(
+        title="YT-DLP REST API",
+        description=API_DESCRIPTION,
+        version=__version__,
+        docs_url="/docs",
+        redoc_url="/redoc",
+        openapi_url="/openapi.json",
+        lifespan=lifespan,
+        contact={
+            "name": "API Support",
+            "url": "https://github.com/fvadicamo/yt-dlp-api",
+        },
+        license_info={
+            "name": "MIT",
+            "url": "https://opensource.org/licenses/MIT",
+        },
+        openapi_tags=[
+            {"name": "health", "description": "Health check endpoints for monitoring"},
+            {"name": "video", "description": "Video metadata and format listing"},
+            {"name": "download", "description": "Download operations"},
+            {"name": "jobs", "description": "Job status tracking"},
+            {"name": "admin", "description": "Cookie management"},
+            {"name": "metrics", "description": "Prometheus metrics"},
+        ],
+    )
+
+    # Add CORS middleware with configurable origins.
+    security_config = SecurityConfig()
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=security_config.cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # Add metrics middleware (before rate limiting to capture all requests).
+    app.add_middleware(MetricsMiddleware)
+    app.add_middleware(RateLimitMiddleware)
+
+    # Register global exception handlers.
+    app.add_exception_handler(Exception, global_exception_handler)
+    app.add_exception_handler(APIError, global_exception_handler)
+
+    # Admin router dependencies.
+    app.dependency_overrides[admin.get_cookie_service] = get_cookie_service
+
+    # Video router dependencies.
+    app.dependency_overrides[video.get_provider_manager] = get_provider_manager
+    app.dependency_overrides[transcript.get_provider_manager] = get_provider_manager
+
+    # Download router dependencies.
+    app.dependency_overrides[download.get_provider_manager] = get_provider_manager
+    app.dependency_overrides[download.get_job_service] = get_job_service
+    app.dependency_overrides[download.get_download_queue] = get_download_queue
+    app.dependency_overrides[download.get_download_worker] = get_download_worker
+
+    # Jobs router dependencies.
+    app.dependency_overrides[jobs.get_job_service] = get_job_service
+    app.dependency_overrides[jobs.get_download_queue] = get_download_queue
+
+    # Register routers.
+    app.include_router(health.router)
+    app.include_router(video.router)
+    app.include_router(transcript.router)
+    app.include_router(download.router)
+    app.include_router(jobs.router)
+    app.include_router(admin.router)
+    app.include_router(metrics.router)
+
+    return app
+
+
+# Create the application instance.
+app = create_app()
+
+
+if __name__ == "__main__":
+    import uvicorn  # type: ignore[import-not-found]
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)  # nosec B104
