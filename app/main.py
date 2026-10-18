@@ -222,6 +222,22 @@ class InstagramYtDlpProvider(YouTubeProvider):
             "after_move:filepath",
         ]
 
+                # Diagnostic: force IPv4 only for Dailymotion URLs.
+        try:
+            parsed_host = (
+                (urlparse(url).hostname or "").lower().rstrip(".")
+            )
+        except ValueError:
+            parsed_host = ""
+
+        if (
+            parsed_host == "dai.ly"
+            or parsed_host == "dailymotion.com"
+            or parsed_host.endswith(".dailymotion.com")
+        ):
+            cmd.append("--force-ipv4")
+            logger.info("Dailymotion IPv4 diagnostic enabled")
+
         # Instagram format selection: support portrait and landscape Reels.
         # Use the shorter video dimension when prioritizing resolution.
         if format_id:
