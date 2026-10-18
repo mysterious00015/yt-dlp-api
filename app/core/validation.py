@@ -51,6 +51,11 @@ class URLValidator:
             "www.youtube.com",
             "m.youtube.com",
             "youtu.be",
+            "instagram.com",
+"www.instagram.com",
+"m.instagram.com",
+"instagr.am",
+"www.instagr.am",
         }
     )
 
