@@ -6,8 +6,10 @@ Implements requirements 12, 16, 19, 20, 29, 39, and 46.
 
 import asyncio
 import contextlib
+import ipaddress
 import json
 import re
+import socket
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -28,6 +30,7 @@ from app.core.logging import configure_logging
 from app.core.metrics import MetricsCollector, initialize_metrics
 from app.core.rate_limiter import configure_rate_limiter
 from app.core.startup import StartupValidator
+from app.core.validation import ValidationResult
 from app.middleware.auth import configure_auth
 from app.middleware.rate_limit import RateLimitMiddleware
 from app.models.video import DownloadResult, VideoFormat
@@ -219,7 +222,7 @@ class InstagramYtDlpProvider(YouTubeProvider):
             "after_move:filepath",
         ]
 
-                        # Instagram format selection: support portrait and landscape Reels.
+        # Instagram format selection: support portrait and landscape Reels.
         # Use the shorter video dimension when prioritizing resolution.
         if format_id:
             quality_match = re.fullmatch(
@@ -338,6 +341,155 @@ class InstagramYtDlpProvider(YouTubeProvider):
 
     def get_cookie_path(self) -> Optional[str]:
         return None
+
+
+# ============================================================
+# UNIVERSAL YT-DLP EXTRACTOR PROVIDER
+# Tries any public HTTP(S) URL and lets installed yt-dlp extractors
+# determine whether the source is supported.
+# ============================================================
+
+class UniversalYtDlpProvider(InstagramYtDlpProvider):
+    """Fallback provider for the site's installed yt-dlp extractors."""
+
+    BLOCKED_SUFFIXES = (
+        ".localhost",
+        ".local",
+        ".internal",
+        ".lan",
+        ".home",
+        ".test",
+        ".invalid",
+        ".example",
+        ".onion",
+    )
+
+    def validate_url(self, url: str) -> bool:
+        return validate_public_media_url(url)
+
+    def extract_video_id(self, url: str) -> Optional[str]:
+        try:
+            parsed = urlparse(url)
+        except ValueError:
+            return None
+
+        # Common query-string identifiers used by media sites.
+        for key in ("v", "video_id", "video", "id", "clip", "post"):
+            value = parsed.query
+            if value:
+                from urllib.parse import parse_qs
+                candidate = parse_qs(value).get(key, [None])[0]
+                if candidate:
+                    return str(candidate)[:150]
+
+        segments = [part for part in (parsed.path or "").split("/") if part]
+        if segments:
+            return segments[-1][:150]
+
+        return (parsed.hostname or "media")[:150]
+
+
+def validate_public_media_url(url: str) -> bool:
+    """Allow public web URLs, rejecting local hosts and private IP targets."""
+    if not isinstance(url, str) or not url.strip():
+        return False
+
+    try:
+        parsed = urlparse(url.strip())
+        host = (parsed.hostname or "").lower().rstrip(".")
+        port = parsed.port
+    except ValueError:
+        return False
+
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return False
+
+    if not host or parsed.username or parsed.password:
+        return False
+
+    if port is not None:
+        # Keep this downloader restricted to ordinary website ports.
+        if (parsed.scheme.lower(), port) not in {("http", 80), ("https", 443)}:
+            return False
+
+    if host == "localhost" or host.endswith(UniversalYtDlpProvider.BLOCKED_SUFFIXES):
+        return False
+
+    # Do not accept a bare single-label hostname.
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        if "." not in host:
+            return False
+        labels = host.split(".")
+        if any(
+            not label
+            or len(label) > 63
+            or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label)
+            for label in labels
+        ):
+            return False
+
+        # Resolve the hostname and reject local/private destinations.
+        # This is a defense-in-depth check; it does not guarantee that
+        # a site's later HTTP redirects will also be public.
+        try:
+            results = socket.getaddrinfo(
+                host,
+                port or (443 if parsed.scheme.lower() == "https" else 80),
+                type=socket.SOCK_STREAM,
+            )
+        except OSError:
+            return False
+
+        if not results:
+            return False
+
+        for result in results:
+            try:
+                resolved = ipaddress.ip_address(result[4][0].split("%")[0])
+            except ValueError:
+                return False
+            if not resolved.is_global:
+                return False
+    else:
+        # Require a public DNS hostname rather than a literal IP URL.
+        return False
+
+    return True
+
+
+class UniversalExtractorURLValidator:
+    """URLValidator-compatible facade for public media websites."""
+
+    def validate(self, url: str) -> ValidationResult:
+        if not validate_public_media_url(url):
+            return ValidationResult(
+                is_valid=False,
+                error_message="URL must be a public HTTP(S) media page.",
+            )
+        return ValidationResult(is_valid=True, sanitized_value=url.strip())
+
+    def is_valid(self, url: str) -> bool:
+        return self.validate(url).is_valid
+
+
+# The download endpoint has a built-in hostname allow-list that otherwise
+# prevents yt-dlp from trying many of its supported extractors. Replace only
+# that endpoint's validator with the public-URL validator above.
+download.url_validator = UniversalExtractorURLValidator()
+video.url_validator = UniversalExtractorURLValidator()
+transcript.url_validator = UniversalExtractorURLValidator()
+
+# Permit the quality selectors used by the Telegram bot.
+download.format_validator.SPECIAL_SELECTORS = frozenset(
+    set(download.format_validator.SPECIAL_SELECTORS)
+    | {
+        "best[height<=480]",
+        "best[height<=720]",
+        "best[height<=1080]",
+    }
+)
 
 
 # ============================================================
@@ -587,6 +739,21 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     logger.info("Instagram yt-dlp provider registered")
 
+    # Register the universal provider last so the specific YouTube and
+    # Instagram providers get first chance, then yt-dlp can try other sites.
+    universal_config = {
+        "retry_attempts": config.providers.youtube.retry_attempts,
+        "retry_backoff": config.providers.youtube.retry_backoff,
+        "output_dir": config.storage.output_dir,
+    }
+    universal_provider = UniversalYtDlpProvider(universal_config)
+    _provider_manager.register_provider(
+        "universal_ytdlp",
+        universal_provider,
+        enabled=True,
+    )
+    logger.info("Universal media extractor provider registered")
+
     # Configure download worker.
     worker = configure_download_worker(
         provider_manager=_provider_manager,
@@ -638,9 +805,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 API_DESCRIPTION = """
 ## Overview
 
-REST API for video downloads and metadata extraction using yt-dlp.
-Supports YouTube downloads and public Instagram media URLs when the
-installed yt-dlp extractor can access the content.
+REST API for media downloads and metadata extraction.
+The universal provider lets the installed extractor engine attempt any
+public website URL it recognizes. Successful extraction is not guaranteed;
+source availability and authentication requirements still apply.
 
 ## Authentication
 
