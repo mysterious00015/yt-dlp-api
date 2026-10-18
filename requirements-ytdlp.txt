@@ -4,7 +4,7 @@
 yt-dlp[default,curl-cffi]==2026.08.19
 
 # Pin curl-cffi for reproducible browser TLS-fingerprint support.
-curl_cffi==0.15.0
+curl_cffi==0.16.3
 
 # EJS challenge-solver scripts for YouTube JavaScript challenges.
 yt-dlp-ejs==0.8.0
