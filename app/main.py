@@ -222,7 +222,7 @@ class InstagramYtDlpProvider(YouTubeProvider):
             "after_move:filepath",
         ]
 
-                # Diagnostic: force IPv4 only for Dailymotion URLs.
+        # Enable verbose yt-dlp diagnostics only for Dailymotion URLs.
         try:
             parsed_host = (
                 (urlparse(url).hostname or "").lower().rstrip(".")
@@ -230,13 +230,15 @@ class InstagramYtDlpProvider(YouTubeProvider):
         except ValueError:
             parsed_host = ""
 
-        if (
+        is_dailymotion = (
             parsed_host == "dai.ly"
             or parsed_host == "dailymotion.com"
             or parsed_host.endswith(".dailymotion.com")
-        ):
-            cmd.append("--force-ipv4")
-            logger.info("Dailymotion IPv4 diagnostic enabled")
+        )
+
+        if is_dailymotion:
+            cmd.append("--verbose")
+            logger.info("Dailymotion verbose diagnostic enabled")
 
         # Instagram format selection: support portrait and landscape Reels.
         # Use the shorter video dimension when prioritizing resolution.
@@ -249,13 +251,14 @@ class InstagramYtDlpProvider(YouTubeProvider):
             if quality_match:
                 quality_cap = quality_match.group(1)
 
-                # Prefer formats at or below the requested resolution.
-                # If none are available, select the best available format
-                # instead of failing with "Requested format is not available".
-                cmd.extend([
-                    "-f", "best",
-                    "-S", f"res:{quality_cap}",
-                ])
+                # Existing Instagram format-selection behavior is preserved.
+                if is_dailymotion:
+                    cmd.extend(["-f", format_id])
+                else:
+                    cmd.extend([
+                        "-f", "best",
+                        "-S", f"res:{quality_cap}",
+                    ])
             else:
                 cmd.extend(["-f", format_id])
 
@@ -288,7 +291,17 @@ class InstagramYtDlpProvider(YouTubeProvider):
         loop = asyncio.get_running_loop()
         started = loop.time()
 
-        result = await self._execute_with_retry(cmd)
+        try:
+            result = await self._execute_with_retry(cmd)
+        except DownloadError as exc:
+            # The retry helper raises on a failed yt-dlp process. Capture
+            # relevant Dailymotion stderr before propagating that exception.
+            if is_dailymotion:
+                self._log_dailymotion_extraction_diagnostics(
+                    media_id,
+                    str(exc),
+                )
+            raise
 
         stdout = result.stdout or b""
         stderr = result.stderr or b""
@@ -309,6 +322,12 @@ class InstagramYtDlpProvider(YouTubeProvider):
                 )[:500] or None
             ),
         )
+
+        if is_dailymotion:
+            self._log_dailymotion_extraction_diagnostics(
+                media_id,
+                stderr.decode("utf-8", errors="replace"),
+            )
 
         file_path = self._extract_file_path(
             stdout.decode("utf-8", errors="replace")
@@ -345,6 +364,46 @@ class InstagramYtDlpProvider(YouTubeProvider):
             format_id=format_id or "best",
         )
 
+    @staticmethod
+    def _log_dailymotion_extraction_diagnostics(
+        media_id: str,
+        output: str,
+    ) -> None:
+        """Log a limited, redacted subset of Dailymotion yt-dlp output."""
+        markers = (
+            "[dailymotion]",
+            "impersonat",
+            "chrome",
+            "firefox",
+            "m3u8",
+            "403 forbidden",
+            "curl_cffi",
+            "request handlers:",
+        )
+
+        diagnostic_lines = []
+
+        for line in output.splitlines():
+            lower_line = line.lower()
+
+            if any(marker in lower_line for marker in markers):
+                # Avoid logging URL query values, which can contain tokens.
+                safe_line = re.sub(
+                    r"(https?://[^\s?]+)\?[^\s]+",
+                    r"\1?<query-redacted>",
+                    line,
+                )
+                diagnostic_lines.append(safe_line)
+
+        logger.info(
+            "Dailymotion extraction diagnostics",
+            video_id=media_id,
+            details=(
+                "\n".join(diagnostic_lines[-30:])[:6000]
+                or "No matching diagnostic lines found"
+            ),
+        )
+
     async def get_transcript(
         self,
         url: str,
@@ -361,8 +420,6 @@ class InstagramYtDlpProvider(YouTubeProvider):
 
 # ============================================================
 # UNIVERSAL YT-DLP EXTRACTOR PROVIDER
-# Tries any public HTTP(S) URL and lets installed yt-dlp extractors
-# determine whether the source is supported.
 # ============================================================
 
 class UniversalYtDlpProvider(InstagramYtDlpProvider):
@@ -389,16 +446,18 @@ class UniversalYtDlpProvider(InstagramYtDlpProvider):
         except ValueError:
             return None
 
-        # Common query-string identifiers used by media sites.
         for key in ("v", "video_id", "video", "id", "clip", "post"):
-            value = parsed.query
-            if value:
+            if parsed.query:
                 from urllib.parse import parse_qs
-                candidate = parse_qs(value).get(key, [None])[0]
+
+                candidate = parse_qs(parsed.query).get(key, [None])[0]
                 if candidate:
                     return str(candidate)[:150]
 
-        segments = [part for part in (parsed.path or "").split("/") if part]
+        segments = [
+            part for part in (parsed.path or "").split("/") if part
+        ]
+
         if segments:
             return segments[-1][:150]
 
@@ -424,31 +483,37 @@ def validate_public_media_url(url: str) -> bool:
         return False
 
     if port is not None:
-        # Keep this downloader restricted to ordinary website ports.
-        if (parsed.scheme.lower(), port) not in {("http", 80), ("https", 443)}:
+        if (parsed.scheme.lower(), port) not in {
+            ("http", 80),
+            ("https", 443),
+        }:
             return False
 
-    if host == "localhost" or host.endswith(UniversalYtDlpProvider.BLOCKED_SUFFIXES):
+    if (
+        host == "localhost"
+        or host.endswith(UniversalYtDlpProvider.BLOCKED_SUFFIXES)
+    ):
         return False
 
-    # Do not accept a bare single-label hostname.
     try:
         address = ipaddress.ip_address(host)
     except ValueError:
         if "." not in host:
             return False
+
         labels = host.split(".")
         if any(
             not label
             or len(label) > 63
-            or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label)
+            or not re.fullmatch(
+                r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?",
+                label,
+            )
             for label in labels
         ):
             return False
 
-        # Resolve the hostname and reject local/private destinations.
-        # This is a defense-in-depth check; it does not guarantee that
-        # a site's later HTTP redirects will also be public.
+        # Defense in depth. Redirect destinations must still be handled safely.
         try:
             results = socket.getaddrinfo(
                 host,
@@ -463,9 +528,12 @@ def validate_public_media_url(url: str) -> bool:
 
         for result in results:
             try:
-                resolved = ipaddress.ip_address(result[4][0].split("%")[0])
+                resolved = ipaddress.ip_address(
+                    result[4][0].split("%")[0]
+                )
             except ValueError:
                 return False
+
             if not resolved.is_global:
                 return False
     else:
@@ -484,15 +552,17 @@ class UniversalExtractorURLValidator:
                 is_valid=False,
                 error_message="URL must be a public HTTP(S) media page.",
             )
-        return ValidationResult(is_valid=True, sanitized_value=url.strip())
+
+        return ValidationResult(
+            is_valid=True,
+            sanitized_value=url.strip(),
+        )
 
     def is_valid(self, url: str) -> bool:
         return self.validate(url).is_valid
 
 
-# The download endpoint has a built-in hostname allow-list that otherwise
-# prevents yt-dlp from trying many of its supported extractors. Replace only
-# that endpoint's validator with the public-URL validator above.
+# Permit public URLs supported by the installed extractors.
 download.url_validator = UniversalExtractorURLValidator()
 video.url_validator = UniversalExtractorURLValidator()
 transcript.url_validator = UniversalExtractorURLValidator()
@@ -513,24 +583,17 @@ download.format_validator.SPECIAL_SELECTORS = frozenset(
 # ============================================================
 
 class MetricsMiddleware(BaseHTTPMiddleware):
-    """Middleware to track HTTP request metrics.
-
-    Records request count and duration for all endpoints,
-    using FastAPI route templates to normalize paths.
-    """
+    """Record request counts and durations."""
 
     async def dispatch(
         self,
         request: Request,
         call_next: RequestResponseEndpoint,
     ) -> Response:
-        """Process request and record metrics."""
         start_time = time.time()
         response = await call_next(request)
         duration = time.time() - start_time
 
-        # Use FastAPI route template for normalized endpoint path.
-        # Use a fixed label for unmatched routes.
         route = request.scope.get("route")
         endpoint = route.path if route else "/unmatched"
 
@@ -558,6 +621,7 @@ def get_provider_manager() -> ProviderManager:
     """Get the global provider manager instance."""
     if _provider_manager is None:
         raise RuntimeError("Provider manager not configured")
+
     return _provider_manager
 
 
@@ -565,6 +629,7 @@ def get_cookie_service() -> CookieService:
     """Get the global cookie service instance."""
     if _cookie_service is None:
         raise RuntimeError("Cookie service not configured")
+
     return _cookie_service
 
 
@@ -585,14 +650,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         version=__version__,
     )
 
-    # Initialize metrics with application version.
     initialize_metrics(__version__)
 
-    # Load configuration.
     config_service = ConfigService()
     config = config_service.load()
 
-    # Configure logging.
     configure_logging(
         config.logging.level,
         config.logging.format,
@@ -604,7 +666,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         output_dir=config.storage.output_dir,
     )
 
-    # Run startup validation.
     validator = StartupValidator(config)
     startup_result = await validator.validate_all()
 
@@ -625,22 +686,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             disabled_providers=startup_result.disabled_providers,
         )
 
-    # Store disabled providers for later use.
     _disabled_providers = startup_result.disabled_providers
 
-    # Configure authentication.
     configure_auth(
         api_keys=config.security.api_keys,
     )
 
-    # Configure rate limiter.
     configure_rate_limiter(
         metadata_rpm=config.rate_limiting.metadata_rpm,
         download_rpm=config.rate_limiting.download_rpm,
         burst_capacity=config.rate_limiting.burst_capacity,
     )
 
-    # Configure storage manager.
     storage = configure_storage(config.storage)
 
     logger.info(
@@ -648,7 +705,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         output_dir=config.storage.output_dir,
     )
 
-    # Configure job service with callback to unregister files on expiry.
     def on_job_expired(job_id: str) -> None:
         """Unregister files when a job expires."""
         storage.unregister_active_job(job_id)
@@ -663,7 +719,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         job_ttl_hours=config.downloads.job_ttl,
     )
 
-    # Configure download queue.
     download_queue = configure_download_queue(
         max_concurrent=config.downloads.max_concurrent,
         max_queue_size=config.downloads.queue_size,
@@ -675,7 +730,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         max_queue_size=config.downloads.queue_size,
     )
 
-    # Configure webhook service (disabled unless explicitly enabled).
     configure_webhook_service(
         enabled=config.webhooks.enabled,
         allowed_hosts=config.webhooks.allowed_hosts,
@@ -690,7 +744,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         allowed_hosts_count=len(config.webhooks.allowed_hosts),
     )
 
-    # Configure cookie service.
     cookie_config = {
         "providers": {
             "youtube": {
@@ -704,10 +757,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     logger.info("Cookie service configured")
 
-    # Configure provider manager and register providers.
     _provider_manager = ProviderManager()
 
-    # Register YouTube provider (skip if disabled by startup validation).
+    # Register YouTube provider.
     if (
         config.providers.youtube.enabled
         and "youtube" not in _disabled_providers
@@ -737,8 +789,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             "YouTube provider disabled due to startup validation failure"
         )
 
-    # Register Instagram provider inline.
-    # No app/providers/generic.py import or file is required.
+    # Register Instagram provider.
     instagram_config = {
         "retry_attempts": config.providers.youtube.retry_attempts,
         "retry_backoff": config.providers.youtube.retry_backoff,
@@ -755,22 +806,23 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     logger.info("Instagram yt-dlp provider registered")
 
-    # Register the universal provider last so the specific YouTube and
-    # Instagram providers get first chance, then yt-dlp can try other sites.
+    # Register the universal provider last.
     universal_config = {
         "retry_attempts": config.providers.youtube.retry_attempts,
         "retry_backoff": config.providers.youtube.retry_backoff,
         "output_dir": config.storage.output_dir,
     }
+
     universal_provider = UniversalYtDlpProvider(universal_config)
+
     _provider_manager.register_provider(
         "universal_ytdlp",
         universal_provider,
         enabled=True,
     )
+
     logger.info("Universal media extractor provider registered")
 
-    # Configure download worker.
     worker = configure_download_worker(
         provider_manager=_provider_manager,
         job_service=job_service,
@@ -778,11 +830,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         storage_manager=storage,
     )
 
-    # Start download worker.
     await worker.start()
     logger.info("Download worker started")
 
-    # Start cleanup scheduler in background.
     from app.services.storage import cleanup_scheduler
 
     _cleanup_task = asyncio.create_task(
@@ -798,17 +848,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     yield
 
-    # Shutdown.
     logger.info("Application shutting down")
 
-    # Stop cleanup scheduler.
     if _cleanup_task:
         _cleanup_task.cancel()
 
         with contextlib.suppress(asyncio.CancelledError):
             await _cleanup_task
 
-    # Stop download worker.
     await worker.stop()
 
     logger.info("Application shutdown complete")
@@ -896,7 +943,6 @@ def create_app() -> FastAPI:
         ],
     )
 
-    # Add CORS middleware with configurable origins.
     security_config = SecurityConfig()
 
     app.add_middleware(
@@ -907,32 +953,25 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # Add metrics middleware (before rate limiting to capture all requests).
     app.add_middleware(MetricsMiddleware)
     app.add_middleware(RateLimitMiddleware)
 
-    # Register global exception handlers.
     app.add_exception_handler(Exception, global_exception_handler)
     app.add_exception_handler(APIError, global_exception_handler)
 
-    # Admin router dependencies.
     app.dependency_overrides[admin.get_cookie_service] = get_cookie_service
 
-    # Video router dependencies.
     app.dependency_overrides[video.get_provider_manager] = get_provider_manager
     app.dependency_overrides[transcript.get_provider_manager] = get_provider_manager
 
-    # Download router dependencies.
     app.dependency_overrides[download.get_provider_manager] = get_provider_manager
     app.dependency_overrides[download.get_job_service] = get_job_service
     app.dependency_overrides[download.get_download_queue] = get_download_queue
     app.dependency_overrides[download.get_download_worker] = get_download_worker
 
-    # Jobs router dependencies.
     app.dependency_overrides[jobs.get_job_service] = get_job_service
     app.dependency_overrides[jobs.get_download_queue] = get_download_queue
 
-    # Register routers.
     app.include_router(health.router)
     app.include_router(video.router)
     app.include_router(transcript.router)
@@ -944,7 +983,6 @@ def create_app() -> FastAPI:
     return app
 
 
-# Create the application instance.
 app = create_app()
 
 
