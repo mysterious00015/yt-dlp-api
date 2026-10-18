@@ -114,6 +114,7 @@ RUN python --version \
     && deno --version \
     && python -m yt_dlp --version \
     && yt-dlp --version \
+    && yt-dlp --list-impersonate-targets \
     && ffmpeg -version
 
 
